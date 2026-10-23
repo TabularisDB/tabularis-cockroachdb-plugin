@@ -8,8 +8,10 @@
 
 use std::io::{self, BufRead, Write};
 
+mod binding;
 mod client;
 mod error;
+mod extract;
 mod handlers;
 mod introspection;
 mod models;
