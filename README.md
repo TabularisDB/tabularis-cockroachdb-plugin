@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
+  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/packages/web-ui/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/assets/plus.svg" width="40" height="40" alt="plus" />
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/cockroachdb-icon.svg" width="120" height="120" alt="CockroachDB logo" />
 </div>
