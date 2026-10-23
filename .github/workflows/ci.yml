@@ -31,8 +31,14 @@ jobs:
       - name: Run tests
         # --lib --bins excludes tests/live_db.rs: that's a live-cluster
         # integration test requiring a running CockroachDB node, covered by
-        # the dedicated live-db-integration job below.
-        run: cargo test --lib --bins
+        # the dedicated live-db-integration job below. --lib only once a
+        # library target exists: cargo rejects it otherwise.
+        run: |
+          if [ -f src/lib.rs ]; then
+            cargo test --lib --bins
+          else
+            cargo test --bins
+          fi
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
