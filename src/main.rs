@@ -11,6 +11,7 @@ use std::io::{self, BufRead, Write};
 mod client;
 mod error;
 mod handlers;
+mod introspection;
 mod models;
 mod rpc;
 mod settings;
