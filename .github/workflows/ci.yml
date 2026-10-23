@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # Default types are opened/synchronize/reopened, which miss title-only
+    # edits — needed so pr-title re-checks a title edit.
+    types: [opened, edited, reopened, synchronize]
+  schedule:
+    # Weekly cargo-audit sweep to catch newly-disclosed CVEs in deps that
+    # haven't otherwise changed. Off-peak minute, not :00/:30.
+    - cron: "23 6 * * 1"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Build
+        run: cargo build
+
+      - name: Run tests
+        # --lib --bins excludes tests/live_db.rs: that's a live-cluster
+        # integration test requiring a running CockroachDB node, covered by
+        # the dedicated live-db-integration job below.
+        run: cargo test --lib --bins
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  validate-manifest:
+    name: Validate .tabularium manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate against the live registry schema
+        run: npx --yes @tabularium/cli validate .tabularium --registry https://registry.tabularis.dev --kind driver
+
+  pr-title:
+    name: PR title (Conventional Commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run markdownlint
+        run: npx --yes markdownlint-cli "**/*.md"
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      # rustsec/audit-check only files a tracking issue for informational
+      # warnings (e.g. "unmaintained") on cron-scheduled runs.
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  live-db-integration:
+    name: Live CockroachDB integration (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported LTS line first, newest last. Bump the LTS entry
+        # together with "Supported versions" in docs/architecture/README.md.
+        image:
+          - cockroachdb/cockroach:latest-v24.3
+          - cockroachdb/cockroach:latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check for live tests
+        id: live
+        shell: bash
+        run: |
+          if [ -f tests/live_db.rs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/live_db.rs not found yet; skipping live CockroachDB tests."
+          fi
+
+      # Service containers can't pass a command, and CockroachDB needs
+      # `start-single-node`, so the node is started with plain docker.
+      - name: Start single-node CockroachDB
+        if: steps.live.outputs.present == 'true'
+        run: |
+          docker run -d --name crdb -p 26257:26257 -p 8080:8080 \
+            ${{ matrix.image }} start-single-node --insecure
+          for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:8080/health?ready=1" > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf "http://127.0.0.1:8080/health?ready=1"
+          docker exec crdb ./cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS testdb"
+
+      - name: Install Rust toolchain
+        if: steps.live.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        if: steps.live.outputs.present == 'true'
+        run: cargo build
+
+      - name: Run live-database integration test
+        if: steps.live.outputs.present == 'true'
+        env:
+          COCKROACHDB_PLUGIN_BIN: ${{ github.workspace }}/target/debug/cockroachdb-plugin
+          CRDB_HOST: 127.0.0.1
+          CRDB_PORT: 26257
+          CRDB_USER: root
+          CRDB_DATABASE: testdb
+          CRDB_SSLMODE: disable
+        run: cargo test --test live_db -- --test-threads=1
+
+      - name: Dump CockroachDB logs on failure
+        if: failure() && steps.live.outputs.present == 'true'
+        run: docker logs crdb

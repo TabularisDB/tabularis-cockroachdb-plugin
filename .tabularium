@@ -1,0 +1,118 @@
+{
+  "$schema": "https://registry.tabularis.dev/manifest.schema.json?kind=driver",
+  "id": "cockroachdb",
+  "name": "CockroachDB",
+  "version": "0.1.0",
+  "description": "CockroachDB driver for Tabularis: browse databases, schemas, tables, views, and sequences; run queries with EXPLAIN plans and automatic transaction-retry handling; edit rows and generate CockroachDB-native DDL.",
+  "category": "database",
+  "tags": ["driver", "cockroachdb", "cockroach", "crdb", "sql", "distributed-sql", "postgres-wire", "relational", "database-driver"],
+  "license": "Apache-2.0",
+  "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/cockroachdb-icon.svg",
+  "color": "#6933FF",
+  "readme": "README.md",
+  "homepage": "https://github.com/TabularisDB/tabularis-cockroachdb-plugin",
+  "documentation_url": "https://github.com/TabularisDB/tabularis-cockroachdb-plugin#readme",
+  "min_runtime_version": "0.29.0",
+  "support": {
+    "issues_url": "https://github.com/TabularisDB/tabularis-cockroachdb-plugin/issues"
+  },
+  "kind": "driver",
+  "engine": "cockroachdb",
+  "paradigms": ["relational"],
+  "default_port": 26257,
+  "default_username": "root",
+  "executable": "cockroachdb-plugin",
+  "capabilities": {
+    "schemas": true,
+    "views": true,
+    "materialized_views": true,
+    "routines": true,
+    "routine_management": false,
+    "triggers": false,
+    "file_based": false,
+    "folder_based": false,
+    "connection_string": true,
+    "connection_string_example": "cockroachdb://root@localhost:26257/defaultdb?sslmode=verify-full",
+    "connection_uri_schemes": ["cockroachdb", "cockroach"],
+    "identifier_quote": "\"",
+    "sql_dialect": "postgres",
+    "alter_primary_key": true,
+    "alter_column": true,
+    "create_foreign_keys": true,
+    "manage_tables": true,
+    "supports_ssl": true,
+    "explain": true,
+    "readonly": false,
+    "no_connection_required": false,
+    "serial_type": "SERIAL",
+    "auto_increment_keyword": "",
+    "inline_pk": false,
+    "column_comments": true,
+    "table_query_templates": false,
+    "drop_table_sql": false
+  },
+  "connection_fields": {
+    "database": {
+      "placeholder": "defaultdb"
+    }
+  },
+  "type_mappings": {
+    "DATETIME": "TIMESTAMP",
+    "JSON": "JSONB",
+    "TEXT": "STRING",
+    "BLOB": "BYTES"
+  },
+  "settings": [
+    {
+      "key": "poolMaxSize",
+      "label": "Pool Max Size",
+      "type": "number",
+      "default": 10,
+      "description": "Maximum number of CockroachDB connections kept in the pool."
+    },
+    {
+      "key": "retryMaxAttempts",
+      "label": "Transaction Retry Attempts",
+      "type": "number",
+      "default": 3,
+      "description": "How many times a statement run outside an explicit transaction is retried after a serialization failure (SQLSTATE 40001). 0 disables retries."
+    },
+    {
+      "key": "applicationName",
+      "label": "Application Name",
+      "type": "string",
+      "default": "tabularis",
+      "description": "Value sent as application_name, shown in the DB Console and crdb_internal session views."
+    }
+  ],
+  "data_types": [
+    {"name": "INT2", "category": "numeric", "requires_length": false, "requires_precision": false},
+    {"name": "INT4", "category": "numeric", "requires_length": false, "requires_precision": false},
+    {"name": "INT8", "category": "numeric", "requires_length": false, "requires_precision": false},
+    {"name": "FLOAT4", "category": "numeric", "requires_length": false, "requires_precision": false},
+    {"name": "FLOAT8", "category": "numeric", "requires_length": false, "requires_precision": false},
+    {"name": "DECIMAL", "category": "numeric", "requires_length": false, "requires_precision": true},
+    {"name": "STRING", "category": "string", "requires_length": false, "requires_precision": false},
+    {"name": "VARCHAR", "category": "string", "requires_length": true, "requires_precision": false},
+    {"name": "CHAR", "category": "string", "requires_length": true, "requires_precision": false},
+    {"name": "BOOL", "category": "boolean", "requires_length": false, "requires_precision": false},
+    {"name": "DATE", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "TIME", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "TIMETZ", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "TIMESTAMP", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "TIMESTAMPTZ", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "INTERVAL", "category": "date", "requires_length": false, "requires_precision": false},
+    {"name": "UUID", "category": "identifier", "requires_length": false, "requires_precision": false},
+    {"name": "JSONB", "category": "json", "requires_length": false, "requires_precision": false},
+    {"name": "BYTES", "category": "binary", "requires_length": false, "requires_precision": false},
+    {"name": "BIT", "category": "bit", "requires_length": true, "requires_precision": false},
+    {"name": "VARBIT", "category": "bit", "requires_length": false, "requires_precision": false},
+    {"name": "INET", "category": "network", "requires_length": false, "requires_precision": false},
+    {"name": "GEOMETRY", "category": "spatial", "requires_length": false, "requires_precision": false},
+    {"name": "GEOGRAPHY", "category": "spatial", "requires_length": false, "requires_precision": false},
+    {"name": "TSVECTOR", "category": "fulltext", "requires_length": false, "requires_precision": false},
+    {"name": "TSQUERY", "category": "fulltext", "requires_length": false, "requires_precision": false},
+    {"name": "VECTOR", "category": "extension", "requires_length": true, "requires_precision": false},
+    {"name": "OID", "category": "system", "requires_length": false, "requires_precision": false}
+  ]
+}
