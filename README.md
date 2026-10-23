@@ -1,7 +1,15 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/packages/web-ui/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/assets/plus.svg" width="40" height="40" alt="plus" />
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/cockroachdb-icon.svg" width="120" height="120" alt="CockroachDB logo" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-light.png" alt="tabularis — the database client your AI agent can actually use" width="600" />
+  </picture>
+
+  <br/>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/assets/cockroachdb-banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/assets/cockroachdb-banner-light.png" alt="Native CockroachDB support" width="600" />
+  </picture>
 </div>
 
 # tabularis-cockroachdb-plugin
