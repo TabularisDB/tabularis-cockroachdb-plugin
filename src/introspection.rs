@@ -297,9 +297,10 @@ pub struct IndexRow {
     pub non_unique: bool,
     pub seq: i64,
     pub column: String,
+    /// The expression for expression indexes (`(lower(email))`).
+    pub definition: String,
     pub storing: bool,
     pub implicit: bool,
-    pub visible: bool,
 }
 
 /// True when `index_name` is the primary key index. Prefer the constraint
@@ -312,47 +313,51 @@ pub fn is_primary_index(index_name: &str, pk_constraint: Option<&str>) -> bool {
     }
 }
 
-/// Group `SHOW INDEXES` rows (one per column) into one entry per index.
-/// Implicit columns CockroachDB added to the key are skipped; `STORING`
-/// columns are reported separately from the key columns.
-pub fn group_indexes(mut rows: Vec<IndexRow>, pk_constraint: Option<&str>) -> Vec<Value> {
-    rows.sort_by_key(|r| r.seq);
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: std::collections::HashMap<String, (Vec<String>, Vec<String>, bool, bool)> =
-        Default::default();
+/// Hidden computed column behind an expression index.
+fn is_expression_column(column: &str) -> bool {
+    column.starts_with("crdb_internal_idx_expr")
+}
+
+/// Hidden shard column behind a hash-sharded index.
+fn is_shard_column(column: &str) -> bool {
+    column.starts_with("crdb_internal_") && column.contains("_shard_")
+}
+
+/// Shape `SHOW INDEXES` rows the way the host expects: **one entry per key
+/// column** (`name`, `column_name`, `seq_in_index`, `is_unique`, `is_primary`,
+/// `is_expression`); the host groups them by `name`. A response with a
+/// different shape fails to deserialize and blanks the whole table in the
+/// sidebar, so do not nest columns into arrays here.
+///
+/// Skipped: implicit columns CockroachDB added to the key, hash-shard
+/// columns, and `STORING` (covering) columns, which are not key columns.
+pub fn index_entries(mut rows: Vec<IndexRow>, pk_constraint: Option<&str>) -> Vec<Value> {
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.seq.cmp(&b.seq)));
+    let mut position: std::collections::HashMap<String, i64> = Default::default();
+    let mut out = Vec::new();
     for r in rows {
-        let entry = groups.entry(r.name.clone()).or_insert_with(|| {
-            order.push(r.name.clone());
-            (Vec::new(), Vec::new(), !r.non_unique, r.visible)
-        });
-        if r.implicit {
+        if r.implicit || r.storing || is_shard_column(&r.column) {
             continue;
         }
-        if r.storing {
-            entry.1.push(r.column);
+        let is_expression = is_expression_column(&r.column);
+        let column_name = if is_expression && !r.definition.is_empty() {
+            r.definition.clone()
         } else {
-            entry.0.push(r.column);
-        }
+            r.column.clone()
+        };
+        // Renumber so that skipped columns leave no gaps.
+        let seq = position.entry(r.name.clone()).or_insert(0);
+        *seq += 1;
+        out.push(json!({
+            "name": r.name,
+            "column_name": column_name,
+            "is_unique": !r.non_unique,
+            "is_primary": is_primary_index(&r.name, pk_constraint),
+            "seq_in_index": *seq,
+            "is_expression": is_expression,
+        }));
     }
-    order
-        .into_iter()
-        .map(|name| {
-            let (columns, mut included, unique, visible) = groups.remove(&name).unwrap_or_default();
-            let primary = is_primary_index(&name, pk_constraint);
-            if primary {
-                // The primary index stores every other column; not useful to show.
-                included.clear();
-            }
-            json!({
-                "index_name": name,
-                "columns": columns,
-                "included_columns": included,
-                "is_unique": unique,
-                "is_primary": primary,
-                "is_visible": visible,
-            })
-        })
-        .collect()
+    out
 }
 
 #[cfg(test)]

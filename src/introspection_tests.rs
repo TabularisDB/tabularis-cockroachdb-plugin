@@ -6,9 +6,9 @@ fn idx(name: &str, seq: i64, col: &str) -> IndexRow {
         non_unique: false,
         seq,
         column: col.into(),
+        definition: col.into(),
         storing: false,
         implicit: false,
-        visible: true,
     }
 }
 
@@ -145,34 +145,74 @@ fn column_json_shapes() {
     assert_eq!(column_json(&e)["is_nullable"], true);
 }
 
-#[test]
-fn groups_indexes_in_key_order() {
-    let rows = vec![idx("b", 2, "y"), idx("a", 1, "x"), idx("b", 1, "z")];
-    let out = group_indexes(rows, None);
-    let b = out.iter().find(|i| i["index_name"] == "b").unwrap();
-    assert_eq!(b["columns"], json!(["z", "y"]));
-    assert_eq!(out.len(), 2);
+fn cols(entries: &[Value], index: &str) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e["name"] == index)
+        .map(|e| e["column_name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
-fn skips_implicit_and_separates_storing() {
+fn one_entry_per_key_column_in_key_order() {
+    let rows = vec![idx("b", 2, "y"), idx("a", 1, "x"), idx("b", 1, "z")];
+    let out = index_entries(rows, None);
+    assert_eq!(out.len(), 3);
+    assert_eq!(cols(&out, "b"), ["z", "y"]);
+    assert_eq!(cols(&out, "a"), ["x"]);
+    let b: Vec<_> = out.iter().filter(|e| e["name"] == "b").collect();
+    assert_eq!(
+        (b[0]["seq_in_index"].as_i64(), b[1]["seq_in_index"].as_i64()),
+        (Some(1), Some(2))
+    );
+}
+
+#[test]
+fn entries_match_the_host_index_shape() {
+    // The host deserializes `name`, `column_name`, `is_unique`, `is_primary`,
+    // `seq_in_index` (and optional `is_expression`); anything else is ignored,
+    // but a missing or mistyped one fails the whole table.
+    let e = &index_entries(vec![idx("i", 1, "c")], None)[0];
+    assert!(e["name"].is_string() && e["column_name"].is_string());
+    assert!(e["is_unique"].is_boolean() && e["is_primary"].is_boolean());
+    assert!(e["seq_in_index"].is_i64() && e["is_expression"].is_boolean());
+    assert!(e.get("columns").is_none());
+}
+
+#[test]
+fn skips_implicit_storing_and_shard_columns() {
     let mut implicit = idx("i", 2, "id");
     implicit.implicit = true;
     let mut storing = idx("i", 3, "extra");
     storing.storing = true;
-    let out = group_indexes(vec![idx("i", 1, "email"), implicit, storing], None);
-    assert_eq!(out[0]["columns"], json!(["email"]));
-    assert_eq!(out[0]["included_columns"], json!(["extra"]));
+    let shard = idx("i", 0, "crdb_internal_email_shard_16");
+    let out = index_entries(vec![idx("i", 1, "email"), implicit, storing, shard], None);
+    assert_eq!(cols(&out, "i"), ["email"]);
+    assert_eq!(out[0]["seq_in_index"], 1);
 }
 
 #[test]
-fn reports_uniqueness_and_visibility() {
+fn expression_indexes_show_the_expression() {
+    let mut e = idx("idx_expr", 1, "crdb_internal_idx_expr");
+    e.definition = "(lower(email))".into();
+    let out = index_entries(vec![e], None);
+    assert_eq!(out[0]["column_name"], "(lower(email))");
+    assert_eq!(out[0]["is_expression"], true);
+}
+
+#[test]
+fn reports_uniqueness() {
     let mut r = idx("i", 1, "c");
     r.non_unique = true;
-    r.visible = false;
-    let out = group_indexes(vec![r], None);
-    assert_eq!(out[0]["is_unique"], false);
-    assert_eq!(out[0]["is_visible"], false);
+    let out = index_entries(vec![r, idx("u", 1, "c")], None);
+    assert_eq!(
+        out.iter().find(|e| e["name"] == "i").unwrap()["is_unique"],
+        false
+    );
+    assert_eq!(
+        out.iter().find(|e| e["name"] == "u").unwrap()["is_unique"],
+        true
+    );
 }
 
 #[test]
@@ -182,13 +222,6 @@ fn primary_index_detection() {
     assert!(is_primary_index("primary", None));
     assert!(is_primary_index("t_pkey", None));
     assert!(!is_primary_index("idx_email", None));
-}
-
-#[test]
-fn same_index_name_in_two_tables_is_not_merged_by_the_grouping_input() {
-    // get_indexes is per table, so names are only grouped within one table.
-    let out = group_indexes(vec![idx("idx_name", 1, "a")], Some("t_pkey"));
-    assert_eq!(out.len(), 1);
 }
 
 #[test]
