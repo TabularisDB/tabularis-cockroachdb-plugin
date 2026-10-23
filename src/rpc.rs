@@ -22,8 +22,11 @@ pub fn handle_line(line: &str) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
 
     match method.as_str() {
-        "initialize" => ok_response(id, Value::Null),
-        "ping" => ok_response(id, Value::Null),
+        "initialize" => {
+            crate::settings::set(crate::settings::Settings::from_value(&params));
+            ok_response(id, Value::Null)
+        }
+        "ping" => handlers::query::ping(id, &params),
         "test_connection" => handlers::query::test_connection(id, &params),
 
         // Metadata — return empty arrays so the driver loads cleanly.

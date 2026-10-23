@@ -13,7 +13,10 @@ mod error;
 mod handlers;
 mod models;
 mod rpc;
+mod settings;
+mod tls;
 mod utils;
+mod version;
 
 fn main() {
     let stdin = io::stdin();
