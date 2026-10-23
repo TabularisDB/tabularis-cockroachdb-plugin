@@ -305,7 +305,7 @@ pub fn get_indexes(id: Value, params: &Value) -> Value {
                 .map(|r| r.get(0));
             let sql = format!(
                 "SELECT index_name::STRING, non_unique, seq_in_index::INT8, column_name::STRING, \
-                        storing, implicit, visible \
+                        definition::STRING, storing, implicit \
                  FROM [SHOW INDEXES FROM {}]",
                 intro::qualified(&c.schema, table)
             );
@@ -317,12 +317,12 @@ pub fn get_indexes(id: Value, params: &Value) -> Value {
                     non_unique: r.get(1),
                     seq: r.get(2),
                     column: r.get(3),
-                    storing: r.get(4),
-                    implicit: r.get(5),
-                    visible: r.get(6),
+                    definition: r.get::<_, Option<String>>(4).unwrap_or_default(),
+                    storing: r.get(5),
+                    implicit: r.get(6),
                 })
                 .collect();
-            Ok(Value::Array(intro::group_indexes(
+            Ok(Value::Array(intro::index_entries(
                 index_rows,
                 pk.as_deref(),
             )))

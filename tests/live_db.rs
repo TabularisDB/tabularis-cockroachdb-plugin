@@ -249,32 +249,34 @@ fn composite_foreign_key_pairs_columns_by_position() {
 }
 
 #[test]
-fn indexes_are_grouped_with_storing_and_primary_flags() {
+fn indexes_have_one_entry_per_key_column_in_the_host_shape() {
     let Some(r) = call("get_indexes", json!({"table": "users"})) else {
         return;
     };
-    let idx = |n: &str| {
-        r.as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["index_name"] == n)
-            .unwrap()
-            .clone()
-    };
-    assert_eq!(idx("users_pkey")["is_primary"], true);
-    assert_eq!(idx("idx_name")["columns"], json!(["name"]));
-    assert_eq!(idx("idx_name")["included_columns"], json!(["price"]));
-    assert_eq!(idx("idx_email")["is_unique"], true);
-    assert_eq!(idx("idx_email")["is_primary"], false);
+    let entries = r.as_array().unwrap();
+    for e in entries {
+        // Fields the host requires; a missing one blanks the whole table.
+        assert!(e["name"].is_string() && e["column_name"].is_string());
+        assert!(e["is_unique"].is_boolean() && e["is_primary"].is_boolean());
+        assert!(e["seq_in_index"].is_i64());
+    }
+    let of = |n: &str| -> Vec<&Value> { entries.iter().filter(|e| e["name"] == n).collect() };
+    assert_eq!(of("users_pkey")[0]["is_primary"], true);
+    assert_eq!(of("users_pkey")[0]["column_name"], "id");
+    // STORING columns are not key columns.
+    assert_eq!(of("idx_name").len(), 1);
+    assert_eq!(of("idx_name")[0]["column_name"], "name");
+    assert_eq!(of("idx_email")[0]["is_unique"], true);
+    assert_eq!(of("idx_email")[0]["is_primary"], false);
     // Same index name on another table is independent.
     let other = call("get_indexes", json!({"table": "nopk"})).unwrap();
     let n = other
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["index_name"] == "idx_name")
+        .find(|i| i["name"] == "idx_name")
         .unwrap();
-    assert_eq!(n["columns"], json!(["a"]));
+    assert_eq!(n["column_name"], "a");
 }
 
 #[test]
