@@ -46,6 +46,8 @@ pub fn handle_line(line: &str) -> Value {
         "get_all_columns_batch" => handlers::metadata::get_all_columns_batch(id, &params),
         "get_all_foreign_keys_batch" => handlers::metadata::get_all_foreign_keys_batch(id, &params),
 
+        "get_table_ddl" => handlers::metadata::get_table_ddl(id, &params),
+
         // View mutation — not implemented by default.
         "create_view" | "alter_view" | "drop_view" => not_implemented(id, &method),
 
@@ -77,6 +79,14 @@ pub fn ok_response(id: Value, result: Value) -> Value {
         "result": result,
         "id": id,
     })
+}
+
+/// Wrap a handler result: `Ok` becomes a result, `Err` a JSON-RPC error.
+pub fn result_response(id: Value, result: Result<Value, crate::error::PluginError>) -> Value {
+    match result {
+        Ok(v) => ok_response(id, v),
+        Err(e) => error_response(id, e.code, &e.message),
+    }
 }
 
 pub fn error_response(id: Value, code: i64, message: &str) -> Value {

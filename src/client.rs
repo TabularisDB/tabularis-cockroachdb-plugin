@@ -264,6 +264,7 @@ async fn resolve_current_schema(client: &tokio_postgres::Client) -> String {
 /// A pool plus the server info captured when its first connection came up.
 pub struct PoolEntry {
     pub pool: Pool,
+    pub database: String,
     info: Arc<Mutex<Option<ServerInfo>>>,
 }
 
@@ -305,7 +306,11 @@ fn build_pool(conn: &Connection, kind: PoolKind, size: usize) -> Result<PoolEntr
         }))
         .build()
         .map_err(|e| PluginError::internal(format!("failed to build pool: {e}")))?;
-    Ok(PoolEntry { pool, info })
+    Ok(PoolEntry {
+        pool,
+        database: conn.database.clone(),
+        info,
+    })
 }
 
 /// Get (or create) the pool for these connection params.
