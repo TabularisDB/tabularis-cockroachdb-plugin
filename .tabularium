@@ -8,7 +8,6 @@
   "tags": ["driver", "cockroachdb", "cockroach", "crdb", "sql", "distributed-sql", "postgres-wire", "relational", "database-driver"],
   "license": "Apache-2.0",
   "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-cockroachdb-plugin/main/cockroachdb-icon.svg",
-  "color": "#6933FF",
   "readme": "README.md",
   "homepage": "https://github.com/TabularisDB/tabularis-cockroachdb-plugin",
   "documentation_url": "https://github.com/TabularisDB/tabularis-cockroachdb-plugin#readme",

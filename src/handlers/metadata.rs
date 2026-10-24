@@ -104,36 +104,38 @@ async fn table_comments(c: &Ctx) -> HashMap<String, String> {
     }
 }
 
-pub fn get_databases(id: Value, params: &Value) -> Value {
+pub async fn get_databases(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let rows = c.client.query(intro::DATABASES_SQL, &[]).await?;
             Ok(Value::Array(
                 rows.iter().map(|r| json!(r.get::<_, String>(0))).collect(),
             ))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_schemas(id: Value, params: &Value) -> Value {
+pub async fn get_schemas(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let rows = c.client.query(intro::SCHEMAS_SQL, &[]).await?;
             Ok(Value::Array(
                 rows.iter().map(|r| json!(r.get::<_, String>(0))).collect(),
             ))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_tables(id: Value, params: &Value) -> Value {
+pub async fn get_tables(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let comments = table_comments(&c).await;
             let tables = list_relations(&c, RelKind::Table).await?;
@@ -151,7 +153,8 @@ pub fn get_tables(id: Value, params: &Value) -> Value {
                     })
                     .collect(),
             ))
-        }),
+        }
+        .await,
     )
 }
 
@@ -196,18 +199,18 @@ async fn columns_of(params: &Value, keys: &[&str]) -> Result<Value, PluginError>
     Ok(Value::Array(rows.iter().map(intro::column_json).collect()))
 }
 
-pub fn get_columns(id: Value, params: &Value) -> Value {
-    result_response(id, client::block_on(columns_of(params, &["table"])))
+pub async fn get_columns(id: Value, params: &Value) -> Value {
+    result_response(id, columns_of(params, &["table"]).await)
 }
 
-pub fn get_view_columns(id: Value, params: &Value) -> Value {
-    result_response(id, client::block_on(columns_of(params, &["view", "table"])))
+pub async fn get_view_columns(id: Value, params: &Value) -> Value {
+    result_response(id, columns_of(params, &["view", "table"]).await)
 }
 
-pub fn get_all_columns_batch(id: Value, params: &Value) -> Value {
+pub async fn get_all_columns_batch(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let tables = tables_param(params);
             let rows = match &tables {
@@ -224,7 +227,8 @@ pub fn get_all_columns_batch(id: Value, params: &Value) -> Value {
                     .push(intro::column_json(r));
             }
             Ok(json!(out))
-        }),
+        }
+        .await,
     )
 }
 
@@ -256,22 +260,23 @@ async fn fetch_fks(
         .collect())
 }
 
-pub fn get_foreign_keys(id: Value, params: &Value) -> Value {
+pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let table = str_param(params, &["table"])?;
             let c = ctx(params).await?;
             let rows = fetch_fks(&c, TableFilter::One, &[], table).await?;
             Ok(Value::Array(rows.iter().map(intro::fk_json).collect()))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_all_foreign_keys_batch(id: Value, params: &Value) -> Value {
+pub async fn get_all_foreign_keys_batch(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let tables = tables_param(params);
             let rows = match &tables {
@@ -288,14 +293,15 @@ pub fn get_all_foreign_keys_batch(id: Value, params: &Value) -> Value {
                     .push(intro::fk_json(r));
             }
             Ok(json!(out))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_indexes(id: Value, params: &Value) -> Value {
+pub async fn get_indexes(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let table = str_param(params, &["table"])?;
             let c = ctx(params).await?;
             let pk: Option<String> = c
@@ -326,14 +332,15 @@ pub fn get_indexes(id: Value, params: &Value) -> Value {
                 index_rows,
                 pk.as_deref(),
             )))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_views(id: Value, params: &Value) -> Value {
+pub async fn get_views(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let c = ctx(params).await?;
             let views = list_relations(&c, RelKind::View).await?;
             Ok(Value::Array(
@@ -342,14 +349,15 @@ pub fn get_views(id: Value, params: &Value) -> Value {
                     .map(|(name, _, _)| json!({ "name": name, "schema": c.schema }))
                     .collect(),
             ))
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_view_definition(id: Value, params: &Value) -> Value {
+pub async fn get_view_definition(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let view = str_param(params, &["view", "table"])?;
             let c = ctx(params).await?;
             let body: Option<String> = c
@@ -361,7 +369,8 @@ pub fn get_view_definition(id: Value, params: &Value) -> Value {
                 Some(b) => Ok(Value::String(b)),
                 None => show_create(&c, "VIEW", view).await,
             }
-        }),
+        }
+        .await,
     )
 }
 
@@ -374,30 +383,31 @@ async fn show_create(c: &Ctx, kind: &str, name: &str) -> Result<Value, PluginErr
     Ok(Value::String(row.get(0)))
 }
 
-pub fn get_table_ddl(id: Value, params: &Value) -> Value {
+pub async fn get_table_ddl(id: Value, params: &Value) -> Value {
     result_response(
         id,
-        client::block_on(async {
+        async {
             let table = str_param(params, &["table"])?;
             let c = ctx(params).await?;
             show_create(&c, "TABLE", table).await
-        }),
+        }
+        .await,
     )
 }
 
-pub fn get_routines(id: Value, _params: &Value) -> Value {
+pub async fn get_routines(id: Value, _params: &Value) -> Value {
     ok_response(id, json!([]))
 }
 
-pub fn get_routine_parameters(id: Value, _params: &Value) -> Value {
+pub async fn get_routine_parameters(id: Value, _params: &Value) -> Value {
     ok_response(id, json!([]))
 }
 
-pub fn get_routine_definition(id: Value, _params: &Value) -> Value {
+pub async fn get_routine_definition(id: Value, _params: &Value) -> Value {
     ok_response(id, Value::String(String::new()))
 }
 
-pub fn get_schema_snapshot(id: Value, _params: &Value) -> Value {
+pub async fn get_schema_snapshot(id: Value, _params: &Value) -> Value {
     // Used for the ER diagram. Return
     // [{ name, columns: [...], foreign_keys: [...] }].
     ok_response(id, json!([]))

@@ -6,12 +6,14 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+#[cfg(test)]
 use tokio::runtime::Runtime as TokioRuntime;
 
 use crate::error::{describe_pg_error, friendly_message, PluginError};
@@ -23,6 +25,8 @@ use crate::version::{is_cockroachdb, parse_crdb_version, CrdbVersion};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Test-only runtime for driving async code from synchronous tests.
+#[cfg(test)]
 fn runtime() -> &'static TokioRuntime {
     static RT: OnceLock<TokioRuntime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -34,6 +38,7 @@ fn runtime() -> &'static TokioRuntime {
     })
 }
 
+#[cfg(test)]
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     runtime().block_on(fut)
 }
@@ -187,7 +192,7 @@ impl Connection {
         cfg
     }
 
-    fn connector(&self) -> Result<tokio_postgres_rustls::MakeRustlsConnect, PluginError> {
+    pub fn connector(&self) -> Result<tokio_postgres_rustls::MakeRustlsConnect, PluginError> {
         tls::build_connector(
             self.ssl_mode,
             self.ssl_ca.as_deref(),
@@ -324,8 +329,6 @@ pub fn get_pool(params: &ConnectionParams, kind: PoolKind) -> Result<Arc<PoolEnt
     if let Some(entry) = map.get(&key) {
         return Ok(entry.clone());
     }
-    // Pool construction needs a runtime context for deadpool's timers.
-    let _guard = runtime().enter();
     let entry = Arc::new(build_pool(&conn, kind, settings.pool_max_size)?);
     map.insert(key, entry.clone());
     Ok(entry)
