@@ -48,6 +48,8 @@ pub fn friendly_message(raw: &str) -> String {
         || lower.contains("missing cluster identifier")
     {
         Some("CockroachDB Cloud needs a cluster routing option. Add options=--cluster%3D<routing-id> to the connection string")
+    } else if lower.contains("password missing") {
+        Some("The server asked for a password. Enter one, or use a client certificate (set ssl_cert and ssl_key)")
     } else if lower.contains("password authentication failed") {
         Some("Authentication failed. Check the password; certificate-auth users need ssl_cert and ssl_key")
     } else if lower.contains("connection refused") {
