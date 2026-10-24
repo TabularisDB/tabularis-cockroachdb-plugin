@@ -64,7 +64,20 @@ pub fn friendly_message(raw: &str) -> String {
 /// Describe a `tokio_postgres` error with SQLSTATE and the full cause chain.
 pub fn describe_pg_error(err: &tokio_postgres::Error) -> String {
     if let Some(db) = err.as_db_error() {
-        return friendly_message(&format!("{} (SQLSTATE {})", db.message(), db.code().code()));
+        let code = db.code().code();
+        if code == "57014" {
+            return format!("Query cancelled (SQLSTATE {code})");
+        }
+        // Keep DETAIL and HINT: CockroachDB hints often link to the docs
+        // (retry errors, unsupported features).
+        let mut text = format!("{} (SQLSTATE {code})", db.message());
+        if let Some(d) = db.detail().filter(|d| !d.is_empty()) {
+            text.push_str(&format!("\nDETAIL: {d}"));
+        }
+        if let Some(h) = db.hint().filter(|h| !h.is_empty()) {
+            text.push_str(&format!("\nHINT: {h}"));
+        }
+        return friendly_message(&text);
     }
     let mut text = err.to_string();
     let mut source = std::error::Error::source(err);
@@ -74,6 +87,11 @@ pub fn describe_pg_error(err: &tokio_postgres::Error) -> String {
         source = s.source();
     }
     friendly_message(&text)
+}
+
+/// SQLSTATE of a server error, if the error came from the server.
+pub fn pg_sqlstate(err: &tokio_postgres::Error) -> Option<String> {
+    err.as_db_error().map(|d| d.code().code().to_string())
 }
 
 impl From<tokio_postgres::Error> for PluginError {

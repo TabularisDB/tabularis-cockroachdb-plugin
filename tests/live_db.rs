@@ -308,3 +308,373 @@ fn views_and_ddl() {
     let ddl = call("get_table_ddl", json!({"table": "users"})).unwrap();
     assert!(ddl.as_str().unwrap().contains("CREATE TABLE"));
 }
+
+// ---- Phase 3: query execution ------------------------------------------
+//
+// These talk to ONE long-lived plugin process, because pinned sessions and
+// cancellation live inside it.
+
+use std::process::{Child, ChildStdin};
+use std::sync::mpsc;
+use std::time::Duration;
+
+struct Plugin {
+    child: Child,
+    stdin: ChildStdin,
+    lines: mpsc::Receiver<String>,
+    next_id: u64,
+}
+
+impl Plugin {
+    fn start() -> Option<Self> {
+        std::env::var("COCKROACH_HOST").ok()?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cockroachdb-plugin"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(Self {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+        })
+    }
+
+    fn conn(&self) -> Value {
+        let mut p = conn("disable").unwrap();
+        p["params"]["database"] = json!("defaultdb");
+        p
+    }
+
+    /// Send a request without waiting; returns its id.
+    fn send(&mut self, method: &str, extra: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = self.conn();
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(self.stdin, "{req}").unwrap();
+        id
+    }
+
+    fn recv(&self, secs: u64) -> Option<Value> {
+        self.lines
+            .recv_timeout(Duration::from_secs(secs))
+            .ok()
+            .map(|l| serde_json::from_str(&l).unwrap())
+    }
+
+    fn call(&mut self, method: &str, extra: Value) -> Value {
+        let id = self.send(method, extra);
+        let r = self.recv(20).expect("no response");
+        assert_eq!(r["id"], id, "{r}");
+        r
+    }
+
+    fn query(&mut self, sql: &str) -> Value {
+        self.call("execute_query", json!({"query": sql}))
+    }
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+#[test]
+fn query_decodes_values_and_keeps_big_ints_exact() {
+    let Some(mut p) = Plugin::start() else { return };
+    let r = p.query("SELECT 1152921504606846977::INT8 AS big, 42::INT8 AS small, 1.50::DECIMAL AS d, 'x' AS s, NULL::INT8 AS n");
+    let res = &r["result"];
+    assert_eq!(res["columns"], json!(["big", "small", "d", "s", "n"]));
+    assert_eq!(
+        res["rows"][0],
+        json!(["1152921504606846977", 42, "1.50", "x", null])
+    );
+    assert_eq!(res["affected_rows"], 0);
+}
+
+#[test]
+fn pagination_fetches_one_extra_row_to_report_has_more() {
+    let Some(mut p) = Plugin::start() else { return };
+    let page = |p: &mut Plugin, n: u64| {
+        p.call("execute_query", json!({"query": "SELECT generate_series(1, 25) AS n ORDER BY 1", "limit": 10, "page": n}))["result"].clone()
+    };
+    let first = page(&mut p, 1);
+    assert_eq!(first["rows"].as_array().unwrap().len(), 10);
+    assert_eq!(first["pagination"]["has_more"], true);
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["rows"][0], json!([1]));
+    let last = page(&mut p, 3);
+    assert_eq!(last["rows"].as_array().unwrap().len(), 5);
+    assert_eq!(last["pagination"]["has_more"], false);
+    assert_eq!(last["rows"][0], json!([21]));
+    // A user LIMIT caps the total across pages.
+    let r = p.call("execute_query", json!({"query": "SELECT generate_series(1, 25) AS n ORDER BY 1 LIMIT 12", "limit": 10, "page": 2}));
+    assert_eq!(r["result"]["rows"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn statements_that_reject_limit_are_capped_client_side() {
+    let Some(mut p) = Plugin::start() else { return };
+    let r = p.call("execute_query", json!({"query": "SHOW TABLES", "limit": 5}));
+    assert!(r.get("error").is_none(), "{r}");
+    assert!(r["result"]["pagination"].is_null());
+}
+
+#[test]
+fn dml_reports_affected_rows_and_returning_rows() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_q1");
+    p.query("CREATE TABLE live_q1 (id INT8 PRIMARY KEY, v STRING)");
+    let ins = p.query("INSERT INTO live_q1 VALUES (1,'a'),(2,'b'),(3,'c')");
+    assert_eq!(ins["result"]["affected_rows"], 3, "{ins}");
+    let upd = p.query("UPDATE live_q1 SET v = 'z' WHERE id < 3");
+    assert_eq!(upd["result"]["affected_rows"], 2);
+    let ret = p.query("INSERT INTO live_q1 VALUES (4,'d') RETURNING id, v");
+    assert_eq!(ret["result"]["rows"], json!([[4, "d"]]), "{ret}");
+    let del = p.query("DELETE FROM live_q1");
+    assert_eq!(del["result"]["affected_rows"], 4);
+    p.query("DROP TABLE live_q1");
+}
+
+#[test]
+fn errors_carry_sqlstate_and_message() {
+    let Some(mut p) = Plugin::start() else { return };
+    let r = p.query("SELECT 1/0");
+    let msg = r["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("division by zero") && msg.contains("SQLSTATE 22012"),
+        "{msg}"
+    );
+    let r = p.query("SELECT * FROM table_that_does_not_exist");
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("SQLSTATE 42P01"));
+}
+
+#[test]
+fn batch_runs_in_order_and_reports_each_statement() {
+    let Some(mut p) = Plugin::start() else { return };
+    let r = p.call(
+        "execute_query_batch",
+        json!({"queries": ["SELECT 1", "SELECT 1/0", "SELECT 3"]}),
+    );
+    let results = r["result"]
+        .as_array()
+        .expect("bare array without a session_id");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["result"]["rows"], json!([[1]]));
+    assert!(
+        results[1]["result"].is_null() && results[1]["error"].as_str().unwrap().contains("22012")
+    );
+    assert_eq!(
+        results[2]["result"]["rows"],
+        json!([[3]]),
+        "later statements still run"
+    );
+    assert!(results[0]["execution_time_ms"].is_number());
+}
+
+#[test]
+fn explicit_transaction_in_one_batch_commits_together() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_q2");
+    p.query("CREATE TABLE live_q2 (id INT8 PRIMARY KEY)");
+    let r = p.call("execute_query_batch", json!({"queries": ["BEGIN", "INSERT INTO live_q2 VALUES (1)", "COMMIT"], "session_id": "t-batch"}));
+    assert_eq!(r["result"]["in_transaction"], false, "{r}");
+    let c = p.query("SELECT count(*) FROM live_q2");
+    assert_eq!(c["result"]["rows"], json!([[1]]));
+    p.query("DROP TABLE live_q2");
+}
+
+#[test]
+fn session_keeps_a_transaction_open_across_runs() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_q3");
+    p.query("CREATE TABLE live_q3 (id INT8 PRIMARY KEY)");
+    let q = |p: &mut Plugin, sql: &str, sid: Option<&str>| match sid {
+        Some(s) => p.call("execute_query", json!({"query": sql, "session_id": s})),
+        None => p.query(sql),
+    };
+
+    let begin = q(&mut p, "BEGIN", Some("tab-1"));
+    assert_eq!(begin["result"]["in_transaction"], true, "{begin}");
+    q(&mut p, "INSERT INTO live_q3 VALUES (1)", Some("tab-1"));
+    // The same tab sees its own uncommitted row on a later run: only possible
+    // because the connection stayed pinned. (A second connection reading the
+    // table would block on the open write, so it is not asserted here.)
+    let own = q(&mut p, "SELECT count(*) FROM live_q3", Some("tab-1"));
+    assert_eq!(own["result"]["result"]["rows"], json!([[1]]), "{own}");
+    assert_eq!(own["result"]["in_transaction"], true);
+
+    let commit = q(&mut p, "COMMIT", Some("tab-1"));
+    assert_eq!(commit["result"]["in_transaction"], false);
+    let after = q(&mut p, "SELECT count(*) FROM live_q3", None);
+    assert_eq!(after["result"]["rows"], json!([[1]]));
+    p.query("DROP TABLE live_q3");
+}
+
+#[test]
+fn a_failed_statement_leaves_the_transaction_aborted_until_rollback() {
+    let Some(mut p) = Plugin::start() else { return };
+    let q = |p: &mut Plugin, sql: &str| {
+        p.call(
+            "execute_query",
+            json!({"query": sql, "session_id": "tab-err"}),
+        )
+    };
+    assert_eq!(q(&mut p, "BEGIN")["result"]["in_transaction"], true);
+    let bad = q(&mut p, "SELECT 1/0");
+    assert!(
+        bad["result"]["error"].as_str().unwrap().contains("22012"),
+        "{bad}"
+    );
+    assert_eq!(
+        bad["result"]["in_transaction"], true,
+        "an aborted transaction is still open: {bad}"
+    );
+    // Not retried and not hidden: the next statement says the transaction is aborted.
+    let next = q(&mut p, "SELECT 1");
+    assert!(
+        next["result"]["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("abort"),
+        "{next}"
+    );
+    let rb = q(&mut p, "ROLLBACK");
+    assert_eq!(rb["result"]["in_transaction"], false, "{rb}");
+    assert_eq!(
+        q(&mut p, "SELECT 1")["result"]["result"]["rows"],
+        json!([[1]])
+    );
+}
+
+#[test]
+fn release_session_rolls_back_and_frees_the_connection() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_q4");
+    p.query("CREATE TABLE live_q4 (id INT8 PRIMARY KEY)");
+    p.call(
+        "execute_query",
+        json!({"query": "BEGIN", "session_id": "tab-rel"}),
+    );
+    p.call(
+        "execute_query",
+        json!({"query": "INSERT INTO live_q4 VALUES (1)", "session_id": "tab-rel"}),
+    );
+    let rel = p.call("release_session", json!({"session_id": "tab-rel"}));
+    assert_eq!(rel["result"]["released"], true);
+    let c = p.query("SELECT count(*) FROM live_q4");
+    assert_eq!(
+        c["result"]["rows"],
+        json!([[0]]),
+        "released session must roll back"
+    );
+    let missing = p.call("release_session", json!({}));
+    assert_eq!(missing["error"]["code"], -32602);
+    p.query("DROP TABLE live_q4");
+}
+
+#[test]
+fn an_unpinned_run_never_leaves_a_transaction_for_the_next_borrower() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_q5");
+    p.query("CREATE TABLE live_q5 (id INT8 PRIMARY KEY)");
+    // No session_id: a transaction left open is rolled back.
+    let r = p.call(
+        "execute_query_batch",
+        json!({"queries": ["BEGIN", "INSERT INTO live_q5 VALUES (1)"]}),
+    );
+    assert!(r["result"].is_array());
+    let c = p.query("SELECT count(*) FROM live_q5");
+    assert_eq!(c["result"]["rows"], json!([[0]]));
+    p.query("DROP TABLE live_q5");
+}
+
+#[test]
+fn schema_is_applied_per_run_and_reset_before_the_connection_is_reused() {
+    let Some(mut p) = Plugin::start() else { return };
+    seed();
+    let r = p.call(
+        "execute_query",
+        json!({"query": "SELECT count(*) FROM users", "schema": SCHEMA}),
+    );
+    assert!(
+        r.get("error").is_none(),
+        "table resolved through the schema: {r}"
+    );
+    let path = p.query("SHOW search_path");
+    assert!(
+        !path["result"]["rows"][0][0]
+            .as_str()
+            .unwrap()
+            .contains(SCHEMA),
+        "{path}"
+    );
+    // A user SET does not leak either, and the application name survives the reset.
+    p.query("SET application_name = 'leaky'");
+    let app = p.query("SHOW application_name");
+    assert_eq!(app["result"]["rows"], json!([["tabularis"]]), "{app}");
+}
+
+#[test]
+fn cancel_stops_a_running_query_and_gets_no_reply_of_its_own() {
+    let Some(mut p) = Plugin::start() else { return };
+    let slow = p.send("execute_query", json!({"query": "SELECT pg_sleep(60)"}));
+    std::thread::sleep(Duration::from_millis(700));
+
+    // The reader keeps reading while the query runs: a ping is answered at once.
+    let ping = p.send("ping", json!({}));
+    let r = p.recv(5).expect("ping must not wait for the slow query");
+    assert_eq!(r["id"], ping, "{r}");
+
+    let started = std::time::Instant::now();
+    writeln!(
+        p.stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "cancel", "params": {"id": slow}})
+    )
+    .unwrap();
+    let r = p.recv(10).expect("cancelled query must answer");
+    assert_eq!(r["id"], slow, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("cancel"),
+        "{r}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+
+    // The notification itself produced no line: the next line is the next reply.
+    let next = p.send("ping", json!({}));
+    assert_eq!(p.recv(5).unwrap()["id"], next);
+    // Cancelling an id that is not running is harmless.
+    writeln!(
+        p.stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "cancel", "params": {"id": 99999}})
+    )
+    .unwrap();
+    let again = p.send("ping", json!({}));
+    assert_eq!(p.recv(5).unwrap()["id"], again);
+}
