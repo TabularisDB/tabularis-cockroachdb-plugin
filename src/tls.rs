@@ -13,6 +13,7 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{aws_lc_rs, CryptoProvider};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
@@ -176,8 +177,10 @@ fn read_file(path: &str, what: &str) -> Result<Vec<u8>, PluginError> {
         .map_err(|e| PluginError::invalid_params(format!("cannot read {what} '{path}': {e}")))
 }
 
+/// Every certificate in a PEM bundle. Other PEM sections (a key in the same
+/// file, say) are skipped.
 pub fn parse_certs(pem: &[u8], what: &str) -> Result<Vec<CertificateDer<'static>>, PluginError> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &*pem)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
         .map_err(|e| PluginError::invalid_params(format!("invalid {what} PEM: {e}")))?;
     if certs.is_empty() {
@@ -190,9 +193,10 @@ pub fn parse_certs(pem: &[u8], what: &str) -> Result<Vec<CertificateDer<'static>
 
 /// Accepts PKCS#8, PKCS#1 (RSA) and SEC1 (EC) PEM keys.
 pub fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, PluginError> {
-    rustls_pemfile::private_key(&mut &*pem)
-        .map_err(|e| PluginError::invalid_params(format!("invalid client key PEM: {e}")))?
-        .ok_or_else(|| PluginError::invalid_params("no private key found in ssl_key"))
+    PrivateKeyDer::from_pem_slice(pem).map_err(|e| match e {
+        PemError::NoItemsFound => PluginError::invalid_params("no private key found in ssl_key"),
+        other => PluginError::invalid_params(format!("invalid client key PEM: {other}")),
+    })
 }
 
 fn root_store(ca_pem: &[u8]) -> Result<Arc<RootCertStore>, PluginError> {
