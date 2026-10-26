@@ -678,3 +678,120 @@ fn cancel_stops_a_running_query_and_gets_no_reply_of_its_own() {
     let again = p.send("ping", json!({}));
     assert_eq!(p.recv(5).unwrap()["id"], again);
 }
+
+// ---- Regression: a host display limit must never change what a write does --
+
+#[test]
+fn a_cte_insert_writes_every_row_whatever_the_host_limit() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_cte1");
+    p.query("CREATE TABLE live_cte1 (n INT8)");
+    let insert =
+        "WITH src AS (SELECT generate_series(1,5) AS n) INSERT INTO live_cte1 SELECT n FROM src";
+
+    // The reported case: limit 2 used to become `LIMIT 3` on the INSERT's source.
+    let r = p.call(
+        "execute_query",
+        json!({"query": insert, "limit": 2, "page": 1}),
+    );
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(r["result"]["affected_rows"], 5, "{r}");
+    let c = p.query("SELECT count(*) FROM live_cte1");
+    assert_eq!(
+        c["result"]["rows"],
+        json!([[5]]),
+        "a display limit must not truncate a write: {c}"
+    );
+
+    // And with no limit, as before.
+    p.query("TRUNCATE live_cte1");
+    let r = p.call("execute_query", json!({"query": insert}));
+    assert_eq!(r["result"]["affected_rows"], 5);
+    p.query("DROP TABLE live_cte1");
+}
+
+#[test]
+fn cte_writes_with_returning_write_everything_and_only_trim_the_display() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_cte2");
+    p.query("CREATE TABLE live_cte2 (n INT8)");
+    let r = p.call(
+        "execute_query",
+        json!({"query": "WITH src AS (SELECT generate_series(1,5) AS n) INSERT INTO live_cte2 SELECT n FROM src RETURNING n", "limit": 2, "page": 1}),
+    );
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(
+        r["result"]["rows"].as_array().unwrap().len(),
+        2,
+        "display capped: {r}"
+    );
+    assert_eq!(r["result"]["truncated"], true);
+    assert!(
+        r["result"]["pagination"].is_null(),
+        "no pagination on a write: {r}"
+    );
+    let c = p.query("SELECT count(*) FROM live_cte2");
+    assert_eq!(
+        c["result"]["rows"],
+        json!([[5]]),
+        "all rows were still written: {c}"
+    );
+    p.query("DROP TABLE live_cte2");
+}
+
+#[test]
+fn cte_update_and_delete_touch_every_row_whatever_the_host_limit() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_cte3");
+    p.query("CREATE TABLE live_cte3 (n INT8, flag BOOL DEFAULT false)");
+    p.query("INSERT INTO live_cte3 (n) SELECT generate_series(1,6)");
+    let upd = p.call(
+        "execute_query",
+        json!({"query": "WITH ids AS (SELECT n FROM live_cte3) UPDATE live_cte3 SET flag = true WHERE n IN (SELECT n FROM ids)", "limit": 2, "page": 1}),
+    );
+    assert_eq!(upd["result"]["affected_rows"], 6, "{upd}");
+    let flagged = p.query("SELECT count(*) FROM live_cte3 WHERE flag");
+    assert_eq!(flagged["result"]["rows"], json!([[6]]));
+
+    let del = p.call(
+        "execute_query",
+        json!({"query": "WITH ids AS (SELECT n FROM live_cte3) DELETE FROM live_cte3 WHERE n IN (SELECT n FROM ids)", "limit": 2, "page": 1}),
+    );
+    assert_eq!(del["result"]["affected_rows"], 6, "{del}");
+    let left = p.query("SELECT count(*) FROM live_cte3");
+    assert_eq!(left["result"]["rows"], json!([[0]]));
+    p.query("DROP TABLE live_cte3");
+}
+
+#[test]
+fn a_data_modifying_cte_feeding_a_select_still_runs_to_completion() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TABLE IF EXISTS live_cte4");
+    p.query("CREATE TABLE live_cte4 (n INT8)");
+    // Pagination may trim the outer SELECT, but the INSERT inside the CTE writes everything.
+    let r = p.call(
+        "execute_query",
+        json!({"query": "WITH ins AS (INSERT INTO live_cte4 SELECT generate_series(1,5) RETURNING n) SELECT n FROM ins ORDER BY n", "limit": 2, "page": 1}),
+    );
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(r["result"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(r["result"]["pagination"]["has_more"], true);
+    let c = p.query("SELECT count(*) FROM live_cte4");
+    assert_eq!(c["result"]["rows"], json!([[5]]), "{c}");
+    p.query("DROP TABLE live_cte4");
+}
+
+#[test]
+fn a_read_only_cte_is_still_paginated() {
+    let Some(mut p) = Plugin::start() else { return };
+    let q = "WITH src AS (SELECT generate_series(1,25) AS n) SELECT n FROM src ORDER BY n";
+    let page = |p: &mut Plugin, n: u64| {
+        p.call("execute_query", json!({"query": q, "limit": 10, "page": n}))["result"].clone()
+    };
+    let first = page(&mut p, 1);
+    assert_eq!(first["rows"].as_array().unwrap().len(), 10);
+    assert_eq!(first["pagination"]["has_more"], true);
+    let last = page(&mut p, 3);
+    assert_eq!(last["rows"], json!([[21], [22], [23], [24], [25]]));
+    assert_eq!(last["pagination"]["has_more"], false);
+}

@@ -194,3 +194,176 @@ fn autocommit_only_statements() {
         assert!(!runs_outside_transaction(q), "{q}");
     }
 }
+
+fn main_kw(q: &str) -> Option<String> {
+    with_main_keyword(q)
+}
+
+#[test]
+fn with_main_keyword_finds_the_statement_after_the_ctes() {
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1) SELECT * FROM s").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("with s as (select 1) insert into t select * from s").as_deref(),
+        Some("INSERT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1) UPDATE t SET a = 1").as_deref(),
+        Some("UPDATE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1) DELETE FROM t").as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1) UPSERT INTO t SELECT * FROM s").as_deref(),
+        Some("UPSERT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1) VALUES (1)").as_deref(),
+        Some("VALUES")
+    );
+}
+
+#[test]
+fn with_main_keyword_handles_every_cte_form() {
+    // several CTEs, column lists, RECURSIVE, [NOT] MATERIALIZED, quoted names
+    assert_eq!(
+        main_kw("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT 1").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("WITH a (x, y) AS (SELECT 1, 2) INSERT INTO t SELECT x FROM a").as_deref(),
+        Some("INSERT")
+    );
+    assert_eq!(main_kw("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) INSERT INTO t SELECT n FROM r").as_deref(), Some("INSERT"));
+    assert_eq!(
+        main_kw("WITH a AS MATERIALIZED (SELECT 1) DELETE FROM t").as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        main_kw("WITH a AS NOT MATERIALIZED (SELECT 1) SELECT 1").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("WITH \"my cte\" AS (SELECT 1) INSERT INTO t VALUES (1)").as_deref(),
+        Some("INSERT")
+    );
+}
+
+#[test]
+fn with_main_keyword_is_not_fooled_by_literals_comments_or_nesting() {
+    // parentheses and keywords inside strings, comments and nested subqueries
+    assert_eq!(
+        main_kw("WITH s AS (SELECT ')' AS p) INSERT INTO t SELECT 1").as_deref(),
+        Some("INSERT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT '(' ) INSERT INTO t SELECT 1").as_deref(),
+        Some("INSERT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 'it''s )' ) DELETE FROM t").as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT E'a\\')b') UPDATE t SET a = 1").as_deref(),
+        Some("UPDATE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT $$ ) INSERT $$) SELECT 1").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT $q$ ) $$ $q$) DELETE FROM t").as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1 /* ) INSERT */) SELECT 1").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT 1 -- ) INSERT\n) SELECT 1").as_deref(),
+        Some("SELECT")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT (SELECT (1))) INSERT INTO t SELECT 1").as_deref(),
+        Some("INSERT")
+    );
+    assert_eq!(
+        main_kw("/* c */ WITH s AS (SELECT \"a)\" FROM t) DELETE FROM t").as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        main_kw("WITH s AS (SELECT $1) SELECT 1").as_deref(),
+        Some("SELECT"),
+        "placeholder, not a dollar quote"
+    );
+}
+
+#[test]
+fn with_main_keyword_gives_up_on_anything_it_cannot_parse() {
+    for q in [
+        "SELECT 1",
+        "WITH",
+        "WITH a",
+        "WITH a AS",
+        "WITH a AS (SELECT 1",
+        "WITH a AS SELECT 1",
+        "WITH a AS (SELECT 1) ",
+        "WITH (SELECT 1) SELECT 1",
+        "WITH a AS (SELECT 1),",
+    ] {
+        assert_eq!(main_kw(q), None, "{q}");
+    }
+}
+
+#[test]
+fn a_cte_write_is_never_paginated() {
+    // The reported bug: `WITH ... INSERT` got `LIMIT n` appended to its source
+    // query and silently wrote fewer rows.
+    for q in [
+        "WITH src AS (SELECT generate_series(1,5) AS n) INSERT INTO t SELECT n FROM src",
+        "WITH src AS (SELECT 1) INSERT INTO t SELECT * FROM src RETURNING *",
+        "WITH src AS (SELECT 1) UPDATE t SET a = 1 FROM src",
+        "WITH src AS (SELECT 1) UPDATE t SET a = 1 RETURNING a",
+        "WITH src AS (SELECT 1) DELETE FROM t USING src",
+        "WITH src AS (SELECT 1) DELETE FROM t RETURNING id",
+        "WITH src AS (SELECT 1) UPSERT INTO t SELECT * FROM src",
+        "with src as (select 1) insert into t select * from src",
+        "-- c\nWITH src AS (SELECT 1) INSERT INTO t SELECT * FROM src",
+        "WITH a AS (SELECT 1), b AS (SELECT 2) INSERT INTO t SELECT * FROM a, b",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) INSERT INTO t SELECT n FROM r",
+    ] {
+        assert!(!supports_trailing_limit(q), "{q}");
+    }
+}
+
+#[test]
+fn unparseable_with_statements_are_not_paginated() {
+    for q in [
+        "WITH",
+        "WITH a AS (SELECT 1",
+        "WITH a AS SELECT 1 INSERT INTO t VALUES (1)",
+    ] {
+        assert!(!supports_trailing_limit(q), "{q}");
+    }
+}
+
+#[test]
+fn a_read_only_cte_is_still_paginated() {
+    for q in [
+        "WITH a AS (SELECT 1) SELECT * FROM a",
+        "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b ORDER BY 1",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r",
+        "WITH a AS (SELECT 1) VALUES (1)",
+        "/* c */ with a as (select 1) select * from a",
+        // A data-modifying CTE always runs to completion; the LIMIT only trims the outer SELECT.
+        "WITH ins AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM ins",
+        "WITH del AS (DELETE FROM t RETURNING id) SELECT id FROM del",
+    ] {
+        assert!(supports_trailing_limit(q), "{q}");
+    }
+}

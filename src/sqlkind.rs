@@ -60,14 +60,239 @@ fn first_keyword(query: &str) -> Option<String> {
     leading_keywords(query, 1).into_iter().next()
 }
 
-/// A statement whose grammar accepts a trailing `LIMIT`/`OFFSET`.
-/// `SHOW` and `CALL` do not (`SHOW x LIMIT 5` is a syntax error), so they are
-/// capped client-side instead.
+/// A token of a SQL statement, reduced to what is needed to find the main
+/// statement of a `WITH` query. Strings, quoted identifiers, dollar quotes and
+/// comments are skipped as opaque tokens, so their contents (parentheses,
+/// `INSERT`, `;`) can never be mistaken for syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    /// A bare word, uppercased (`SELECT`, `src`, `AS`, ...).
+    Word(String),
+    /// A double-quoted identifier.
+    Quoted,
+    /// A string literal or dollar-quoted body.
+    Str,
+    Open,
+    Close,
+    Comma,
+    Other,
+}
+
+fn tokenize(sql: &str) -> Vec<Tok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            c if c.is_whitespace() => i += 1,
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < chars.len() && depth > 0 {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            '\'' => {
+                // `E'...'` strings also escape with a backslash.
+                let escaped = i > 0
+                    && matches!(chars[i - 1], 'e' | 'E')
+                    && (i < 2 || !(chars[i - 2].is_ascii_alphanumeric() || chars[i - 2] == '_'));
+                i += 1;
+                while i < chars.len() {
+                    if escaped && chars[i] == '\\' {
+                        i += 2;
+                    } else if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                // An `E` directly before the quote belongs to the literal.
+                if matches!(toks.last(), Some(Tok::Word(w)) if (w == "E") && escaped) {
+                    toks.pop();
+                }
+                toks.push(Tok::Str);
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '"' {
+                        if chars.get(i + 1) == Some(&'"') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                toks.push(Tok::Quoted);
+            }
+            '$' => {
+                // `$tag$ ... $tag$` (tag may be empty). `$1` is a placeholder.
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let tag_ok = j > i + 1 && !chars[i + 1].is_ascii_digit() || j == i + 1;
+                if tag_ok && chars.get(j) == Some(&'$') {
+                    let delim: String = chars[i..=j].iter().collect();
+                    let rest: String = chars[j + 1..].iter().collect();
+                    i = match rest.find(&delim) {
+                        Some(at) => j + 1 + rest[..at].chars().count() + delim.chars().count(),
+                        None => chars.len(),
+                    };
+                    toks.push(Tok::Str);
+                } else {
+                    i += 1;
+                    toks.push(Tok::Other);
+                }
+            }
+            '(' => {
+                i += 1;
+                toks.push(Tok::Open);
+            }
+            ')' => {
+                i += 1;
+                toks.push(Tok::Close);
+            }
+            ',' => {
+                i += 1;
+                toks.push(Tok::Comma);
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                toks.push(Tok::Word(
+                    chars[start..i]
+                        .iter()
+                        .collect::<String>()
+                        .to_ascii_uppercase(),
+                ));
+            }
+            _ => {
+                i += 1;
+                toks.push(Tok::Other);
+            }
+        }
+    }
+    toks
+}
+
+/// Index just past the balanced `( ... )` group that opens at `toks[at]`.
+fn skip_group(toks: &[Tok], at: usize) -> Option<usize> {
+    if toks.get(at) != Some(&Tok::Open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate().skip(at) {
+        match t {
+            Tok::Open => depth += 1,
+            Tok::Close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The keyword of the statement that follows a `WITH` clause: `SELECT` for
+/// `WITH a AS (...) SELECT ...`, `INSERT` for `WITH a AS (...) INSERT ...`.
+///
+/// `WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED] (query) [, ...] main`.
+/// `None` when the clause cannot be parsed; callers must then treat the
+/// statement as possibly writing.
+pub fn with_main_keyword(query: &str) -> Option<String> {
+    let toks = tokenize(query);
+    let mut i = 0;
+    if toks.get(i) != Some(&Tok::Word("WITH".into())) {
+        return None;
+    }
+    i += 1;
+    if toks.get(i) == Some(&Tok::Word("RECURSIVE".into())) {
+        i += 1;
+    }
+    loop {
+        // CTE name.
+        if !matches!(toks.get(i), Some(Tok::Word(_) | Tok::Quoted)) {
+            return None;
+        }
+        i += 1;
+        // Optional column list.
+        if toks.get(i) == Some(&Tok::Open) {
+            i = skip_group(&toks, i)?;
+        }
+        if toks.get(i) != Some(&Tok::Word("AS".into())) {
+            return None;
+        }
+        i += 1;
+        if toks.get(i) == Some(&Tok::Word("NOT".into())) {
+            i += 1;
+        }
+        if toks.get(i) == Some(&Tok::Word("MATERIALIZED".into())) {
+            i += 1;
+        }
+        i = skip_group(&toks, i)?;
+        if toks.get(i) == Some(&Tok::Comma) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    match toks.get(i) {
+        Some(Tok::Word(w)) => Some(w.clone()),
+        _ => None,
+    }
+}
+
+/// A statement that only reads, and whose grammar accepts a trailing
+/// `LIMIT`/`OFFSET`: `SELECT`, `VALUES`, `TABLE`, and a `WITH` whose main
+/// statement is one of those.
+///
+/// A host display limit must never change what a statement writes, so a
+/// `WITH ... INSERT | UPDATE | DELETE | UPSERT` (with or without `RETURNING`)
+/// is never paginated: a `LIMIT` appended to it would apply to the write's
+/// source query and silently write fewer rows. `WITH ins AS (INSERT ...)
+/// SELECT ...` is safe, because a data-modifying CTE always runs to
+/// completion and the `LIMIT` only trims the outer `SELECT`.
+///
+/// `SHOW` and `CALL` reject `LIMIT` (`SHOW x LIMIT 5` is a syntax error), so
+/// they, and anything that cannot be classified, are capped client-side.
 pub fn supports_trailing_limit(query: &str) -> bool {
-    matches!(
-        first_keyword(query).as_deref(),
-        Some("SELECT" | "WITH" | "VALUES" | "TABLE")
-    )
+    match first_keyword(query).as_deref() {
+        Some("SELECT" | "VALUES" | "TABLE") => true,
+        Some("WITH") => matches!(
+            with_main_keyword(query).as_deref(),
+            Some("SELECT" | "VALUES" | "TABLE")
+        ),
+        _ => false,
+    }
 }
 
 /// What a statement does to the surrounding transaction.
