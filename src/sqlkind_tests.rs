@@ -367,3 +367,16 @@ fn a_read_only_cte_is_still_paginated() {
         assert!(supports_trailing_limit(q), "{q}");
     }
 }
+
+#[test]
+fn set_config_counts_as_session_state_wherever_it_appears() {
+    for q in [
+        "SELECT set_config('application_name', 'x', false)",
+        "select SET_CONFIG('a','b',false)",
+        "WITH s AS (SELECT set_config('a','b',false)) SELECT * FROM s",
+        "/* c */ SELECT 1, set_config('a', 'b', false)",
+    ] {
+        assert!(sets_session_state(q), "{q}");
+    }
+    assert!(!sets_session_state("SELECT 1"));
+}

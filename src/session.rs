@@ -25,6 +25,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 struct Pinned {
     client: Object,
     last_used: Instant,
+    /// Session state (a `SET`, the search path, a temp table) that a run set on
+    /// this connection and that has not been reset yet. It must outlive the
+    /// run that set it: a later run in the same transaction, a `COMMIT` that
+    /// applies no schema and runs no `SET`, can be the one that frees the
+    /// connection, and it has to know the connection is dirty.
+    dirty: bool,
 }
 
 /// A session's pinned connection, if any. Holding the guard serializes runs.
@@ -42,15 +48,19 @@ impl Drop for Slot {
 }
 
 impl Slot {
-    /// Take the pinned connection; the caller must pin it again or end its transaction.
-    pub fn take(&mut self) -> Option<Object> {
-        self.0.take().map(|p| p.client)
+    /// Take the pinned connection and whether it still carries session state;
+    /// the caller must pin it again (keeping the flag) or end its transaction.
+    pub fn take(&mut self) -> Option<(Object, bool)> {
+        self.0.take().map(|p| (p.client, p.dirty))
     }
 
-    pub fn pin(&mut self, client: Object) {
+    /// Pin `client` until the session ends its transaction. `dirty` is
+    /// whether it carries session state that must be reset before reuse.
+    pub fn pin(&mut self, client: Object, dirty: bool) {
         self.0 = Some(Pinned {
             client,
             last_used: Instant::now(),
+            dirty,
         });
     }
 }
@@ -66,12 +76,23 @@ fn sessions() -> &'static Mutex<SessionMap> {
     SESSIONS.get_or_init(Default::default)
 }
 
-/// End the transaction before the client goes back to the pool. A failing
-/// `ROLLBACK` is only logged: the connection is unusable and the pool will
-/// discard it.
+/// End the transaction and clear session state before the client goes back
+/// to the pool, which recycles connections without resetting anything.
+///
+/// `RESET ALL` always runs: a connection that was pinned to a session is
+/// released from several places (an idle sweep, `release_session`, shutdown)
+/// and a run that left a transaction open without a session, and none of them
+/// can know which `SET`s the session ran. If either statement fails the
+/// connection cannot be trusted, so it is closed instead of returned.
 pub async fn rollback_and_release(client: Object) {
-    if let Err(e) = client.batch_execute("ROLLBACK").await {
-        eprintln!("ROLLBACK while releasing a pinned session failed: {e}");
+    let cleaned = async {
+        client.batch_execute("ROLLBACK").await?;
+        client.batch_execute("RESET ALL").await
+    }
+    .await;
+    if let Err(e) = cleaned {
+        eprintln!("cleaning a pinned session failed, closing the connection: {e}");
+        drop(Object::take(client));
     }
 }
 
@@ -102,7 +123,7 @@ pub async fn sweep_idle() {
                 .as_ref()
                 .is_some_and(|p| now.duration_since(p.last_used) > MAX_IDLE)
             {
-                expired.extend(guard.take());
+                expired.extend(guard.take().map(|(client, _)| client));
             }
             guard.0.is_some() || Arc::strong_count(slot) > 1
         });
@@ -119,8 +140,8 @@ pub async fn sweep_idle() {
 /// Roll back and release the connection pinned to `session_id`, if any,
 /// after any run still in flight for it finishes.
 pub async fn release(session_id: &str) {
-    let client = lock(session_id).await.take();
-    if let Some(client) = client {
+    let pinned = lock(session_id).await.take();
+    if let Some((client, _)) = pinned {
         rollback_and_release(client).await;
     }
 }
@@ -135,7 +156,7 @@ pub async fn release_all() {
         .await
         .retain(|_, slot| match slot.try_lock() {
             Ok(mut guard) => {
-                clients.extend(guard.take());
+                clients.extend(guard.take().map(|(client, _)| client));
                 false
             }
             Err(_) => true,
