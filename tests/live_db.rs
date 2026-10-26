@@ -327,6 +327,19 @@ struct Plugin {
 
 impl Plugin {
     fn start() -> Option<Self> {
+        Self::start_with(json!({}))
+    }
+
+    /// Start with `initialize` settings (e.g. `{"poolMaxSize": 1}`).
+    fn start_with(settings: Value) -> Option<Self> {
+        let mut p = Self::spawn()?;
+        let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"settings": settings}});
+        writeln!(p.stdin, "{init}").unwrap();
+        assert_eq!(p.recv(10).expect("initialize reply")["id"], 0);
+        Some(p)
+    }
+
+    fn spawn() -> Option<Self> {
         std::env::var("COCKROACH_HOST").ok()?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_cockroachdb-plugin"))
             .stdin(Stdio::piped())
@@ -794,4 +807,152 @@ fn a_read_only_cte_is_still_paginated() {
     let last = page(&mut p, 3);
     assert_eq!(last["rows"], json!([[21], [22], [23], [24], [25]]));
     assert_eq!(last["pagination"]["has_more"], false);
+}
+
+// ---- Regression: session state must not leak to the next borrower ----------
+//
+// `poolMaxSize: 1` makes the reproduction deterministic: every run, from any
+// tab, gets the same physical connection.
+
+fn tab(p: &mut Plugin, session: &str, sql: &str) -> Value {
+    p.call(
+        "execute_query",
+        json!({"query": sql, "schema": "public", "session_id": session}),
+    )
+}
+
+fn app_name(p: &mut Plugin, session: &str) -> Value {
+    let r = tab(p, session, "SHOW application_name");
+    r["result"]["result"]["rows"][0][0].clone()
+}
+
+#[test]
+fn set_in_a_transaction_does_not_outlive_commit_across_separate_calls() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    assert_eq!(app_name(&mut p, "tab-base"), "tabularis", "baseline");
+
+    assert_eq!(
+        tab(&mut p, "tab-a", "BEGIN")["result"]["in_transaction"],
+        true
+    );
+    tab(
+        &mut p,
+        "tab-a",
+        "SET application_name = 'repro-leaked-state'",
+    );
+    // The setting is visible to its own transaction...
+    assert_eq!(app_name(&mut p, "tab-a"), "repro-leaked-state");
+    let commit = tab(&mut p, "tab-a", "COMMIT");
+    assert_eq!(commit["result"]["in_transaction"], false, "{commit}");
+
+    // ...and gone before another tab borrows the connection.
+    assert_eq!(
+        app_name(&mut p, "tab-b"),
+        "tabularis",
+        "state leaked to the next tab"
+    );
+}
+
+#[test]
+fn set_in_a_transaction_does_not_outlive_rollback_across_separate_calls() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    tab(&mut p, "tab-a", "BEGIN");
+    tab(
+        &mut p,
+        "tab-a",
+        "SET application_name = 'leaked-by-rollback-tab'",
+    );
+    let rb = tab(&mut p, "tab-a", "ROLLBACK");
+    assert_eq!(rb["result"]["in_transaction"], false);
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn set_does_not_outlive_release_session() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    tab(&mut p, "tab-a", "BEGIN");
+    tab(
+        &mut p,
+        "tab-a",
+        "SET application_name = 'leaked-by-release'",
+    );
+    let rel = p.call("release_session", json!({"session_id": "tab-a"}));
+    assert_eq!(rel["result"]["released"], true);
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn set_left_in_an_unpinned_open_transaction_is_cleaned_up() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    // No session_id: the open transaction is rolled back, and nothing leaks.
+    let r = p.call(
+        "execute_query_batch",
+        json!({"queries": ["BEGIN", "SET application_name = 'leaked-unpinned'"], "schema": "public"}),
+    );
+    assert!(r["result"].is_array());
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn a_set_in_a_run_with_no_transaction_does_not_leak_either() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    tab(
+        &mut p,
+        "tab-a",
+        "SET application_name = 'leaked-autocommit'",
+    );
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn set_config_does_not_leak() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    tab(
+        &mut p,
+        "tab-a",
+        "SELECT set_config('application_name', 'leaked-set-config', false)",
+    );
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn a_session_keeps_its_settings_for_the_whole_transaction() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    tab(&mut p, "tab-a", "BEGIN");
+    tab(&mut p, "tab-a", "SET application_name = 'mine'");
+    // Several more runs inside the same transaction keep seeing it.
+    for _ in 0..3 {
+        assert_eq!(app_name(&mut p, "tab-a"), "mine");
+    }
+    tab(&mut p, "tab-a", "COMMIT");
+    assert_eq!(app_name(&mut p, "tab-b"), "tabularis");
+}
+
+#[test]
+fn set_config_does_not_leak_when_no_schema_masks_it() {
+    // With a schema, the per-run search_path cleanup would hide a missed
+    // `set_config`; without one, only the statement classifier catches it.
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    p.call(
+        "execute_query",
+        json!({"query": "SELECT set_config('application_name', 'leaked-bare', false)"}),
+    );
+    let r = p.call("execute_query", json!({"query": "SHOW application_name"}));
+    assert_eq!(r["result"]["rows"][0][0], "tabularis", "{r}");
 }

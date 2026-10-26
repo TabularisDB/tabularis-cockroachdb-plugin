@@ -348,13 +348,18 @@ pub fn transaction_effect(query: &str) -> TransactionEffect {
     }
 }
 
-/// A session `SET` (not `SET LOCAL`, not `SET TRANSACTION`), `USE`, or a
-/// temporary table: state that lives on the connection, so the connection
-/// must be reset before it goes back to the pool.
+/// Statements that change state living on the connection: a session `SET`
+/// (not `SET LOCAL`, `SET TRANSACTION` or `SET CLUSTER SETTING`), `USE`, a
+/// temporary table, or `set_config(...)` anywhere in the statement. The
+/// connection must be reset before it goes back to the pool.
+///
+/// `set_config` is matched as a substring, so a literal that merely contains
+/// the word costs one extra `RESET ALL`: a false positive is only a cleanup,
+/// a false negative leaks a setting to the next tab.
 pub fn sets_session_state(query: &str) -> bool {
     let words = leading_keywords(query, 4);
     let at = |i: usize| words.get(i).map(String::as_str);
-    match at(0) {
+    let by_keyword = match at(0) {
         Some("SET") => !matches!(
             at(1),
             Some("LOCAL" | "TRANSACTION" | "CONSTRAINTS" | "CLUSTER")
@@ -366,7 +371,8 @@ pub fn sets_session_state(query: &str) -> bool {
                     && matches!(at(2), Some("TEMP" | "TEMPORARY")))
         }
         _ => false,
-    }
+    };
+    by_keyword || query.to_ascii_lowercase().contains("set_config")
 }
 
 /// Statements CockroachDB cannot run inside an explicit transaction, or that

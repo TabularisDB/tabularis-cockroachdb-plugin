@@ -198,6 +198,12 @@ async fn run_batch(
     session_id: Option<&str>,
     request_id: &Value,
 ) -> Result<(Vec<Value>, bool), PluginError> {
+    // Everything that can fail before a connection is in hand happens first, so
+    // an error can never drop a pinned connection (and its open transaction)
+    // into the pool.
+    let entry = client::get_pool(conn_params, PoolKind::Query)?;
+    let connection = Connection::resolve(conn_params, &settings::get())?;
+
     // Held for the whole run, so an overlapping call for the same session waits.
     let mut slot = match session_id {
         Some(sid) => Some(session::lock(sid).await),
@@ -207,25 +213,25 @@ async fn run_batch(
     let reused = pinned.is_some();
     // A pinned connection exists only because its transaction is still open.
     let mut in_transaction = reused;
+    // Session state set by this or any earlier run that has not been reset
+    // yet. It travels with a pinned connection: a `COMMIT` run applies no
+    // schema and runs no `SET`, but it is the run that frees the connection.
+    let mut dirty = pinned.as_ref().is_some_and(|(_, dirty)| *dirty);
 
-    let entry = client::get_pool(conn_params, PoolKind::Query)?;
     let client = match pinned {
-        Some(c) => c,
+        Some((c, _)) => c,
         None => entry.pool.get().await.map_err(client::pool_error)?,
     };
-    let connection = Connection::resolve(conn_params, &settings::get())?;
     let guard = cancel::CancelGuard::register(request_id, &client, connection);
 
     // On a reused connection the search path would change inside the open
     // transaction, and what the rest of it sees.
-    let mut schema_applied = false;
     if let Some(s) = schema.filter(|s| !s.is_empty() && !reused) {
         let sql = format!("SET search_path TO {}", quote_identifier(s, '"'));
         client.batch_execute(&sql).await?;
-        schema_applied = true;
+        dirty = true;
     }
 
-    let mut session_state_set = false;
     let mut results = Vec::with_capacity(queries.len());
     for query in queries {
         let start = Instant::now();
@@ -235,7 +241,7 @@ async fn run_batch(
         in_transaction = sqlkind::transaction_effect(query)
             .in_transaction_after(outcome.is_ok(), in_transaction);
         if outcome.is_ok() && sqlkind::sets_session_state(query) {
-            session_state_set = true;
+            dirty = true;
         }
         results.push(match outcome {
             Ok(result) => {
@@ -252,10 +258,12 @@ async fn run_batch(
     in_transaction = transaction_open(&client, in_transaction).await;
     if in_transaction {
         match slot.as_mut() {
-            Some(slot) => slot.pin(client),
+            // Keep the flag with the connection: the run that ends the
+            // transaction may be a bare `COMMIT` that knows nothing about it.
+            Some(slot) => slot.pin(client, dirty),
             None => session::rollback_and_release(client).await,
         }
-    } else if schema_applied || session_state_set {
+    } else if dirty {
         // The pool does not reset connections: undo `SET`s and the search path
         // before the next borrower gets this one. If that fails the connection
         // is not trustworthy, so close it rather than return it.
