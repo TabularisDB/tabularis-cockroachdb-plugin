@@ -140,16 +140,20 @@ jobs:
         if: steps.live.outputs.present == 'true'
         run: cargo build
 
-      - name: Run live-database integration test
+      # Runs every test, not only `tests/live_db.rs`: the decoding and binding
+      # tests live inside the crate and also need the node.
+      #
+      # The variable names must match `tests/live_db.rs` and `src/testenv.rs`.
+      # A live test with no host skips and is reported as *passed*, so
+      # REQUIRE_LIVE_DB turns a missing host into a failure instead of letting
+      # this job go green without testing anything.
+      - name: Run live-database tests
         if: steps.live.outputs.present == 'true'
         env:
-          COCKROACHDB_PLUGIN_BIN: ${{ github.workspace }}/target/debug/cockroachdb-plugin
-          CRDB_HOST: 127.0.0.1
-          CRDB_PORT: 26257
-          CRDB_USER: root
-          CRDB_DATABASE: testdb
-          CRDB_SSLMODE: disable
-        run: cargo test --test live_db -- --test-threads=1
+          COCKROACH_HOST: 127.0.0.1
+          COCKROACH_PORT: 26257
+          REQUIRE_LIVE_DB: "1"
+        run: cargo test --locked --no-fail-fast -- --test-threads=1
 
       - name: Dump CockroachDB logs on failure
         if: failure() && steps.live.outputs.present == 'true'

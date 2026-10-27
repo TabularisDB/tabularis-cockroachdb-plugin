@@ -289,11 +289,7 @@ fn enums_are_labels() {
 // ---- live: real CockroachDB wire encodings (set COCKROACH_HOST) ----------
 
 fn live_rows(sql: &str) -> Option<Vec<Vec<Value>>> {
-    let host = std::env::var("COCKROACH_HOST").ok()?;
-    let port: u16 = std::env::var("COCKROACH_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(26257);
+    let (host, port) = crate::testenv::live_node()?;
     crate::client::block_on(async {
         let (client, conn) = tokio_postgres::Config::new()
             .host(&host)
@@ -389,14 +385,9 @@ fn live_extension_like_types() {
 
 #[test]
 fn live_enum_and_enum_array() {
-    let host = match std::env::var("COCKROACH_HOST") {
-        Ok(h) => h,
-        Err(_) => return,
+    let Some((host, port)) = crate::testenv::live_node() else {
+        return;
     };
-    let port: u16 = std::env::var("COCKROACH_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(26257);
     crate::client::block_on(async {
         let (client, conn) = tokio_postgres::Config::new()
             .host(&host)

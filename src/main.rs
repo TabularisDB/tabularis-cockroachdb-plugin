@@ -27,6 +27,8 @@ mod session;
 mod settings;
 mod sqlkind;
 mod sqlscan;
+#[cfg(test)]
+mod testenv;
 mod tls;
 mod utils;
 mod version;

@@ -296,13 +296,9 @@ fn array_literal_escaping() {
 
 #[test]
 fn live_round_trip() {
-    let Ok(host) = std::env::var("COCKROACH_HOST") else {
+    let Some((host, port)) = crate::testenv::live_node() else {
         return;
     };
-    let port: u16 = std::env::var("COCKROACH_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(26257);
     crate::client::block_on(async {
         let (client, conn) = tokio_postgres::Config::new()
             .host(&host)
