@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
 use crate::error::PluginError;
-use crate::utils::blob::decode_blob;
+use crate::utils::blob::{decode_blob, resolve_blob_file_ref, DEFAULT_MAX_BLOB_SIZE};
 
 pub type PgParam = Box<dyn ToSql + Sync + Send>;
 pub type TypedPgParam = (PgParam, Type);
@@ -46,6 +46,9 @@ pub struct BindOptions<'a> {
     /// the column is an enum.
     pub enum_type: Option<&'a str>,
     pub allow_default: bool,
+    /// Largest file accepted for a `BLOB_FILE_REF`; the host's `maxBlobSize`.
+    /// `None` means the default (100 MiB).
+    pub max_blob_size: Option<u64>,
 }
 
 pub const USE_DEFAULT_SENTINEL: &str = "__USE_DEFAULT__";
@@ -187,8 +190,15 @@ pub fn bind_value(value: Value, idx: usize, opts: &BindOptions) -> Result<BoundV
     let kind = opts.column_type.map(kind_of);
 
     // 3. BLOB wire format, for BYTES columns (or when the type is unknown).
+    //    `BLOB_FILE_REF:` is a file the user picked; an unreadable or oversized
+    //    file is an error, never silently stored as the text of its own path.
     if let Value::String(s) = &value {
         if matches!(kind, Some(Kind::Bytes) | None) {
+            if s.starts_with("BLOB_FILE_REF:") {
+                let max = opts.max_blob_size.unwrap_or(DEFAULT_MAX_BLOB_SIZE);
+                let bytes = resolve_blob_file_ref(s, max).map_err(PluginError::invalid_params)?;
+                return Ok(plain(idx, Box::new(bytes), Type::BYTEA));
+            }
             if let Some(bytes) = decode_blob(s) {
                 return Ok(plain(idx, Box::new(bytes), Type::BYTEA));
             }
