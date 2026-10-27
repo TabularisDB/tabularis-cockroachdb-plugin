@@ -28,7 +28,7 @@ use crate::session;
 use crate::settings;
 use crate::sqlkind::{self, TransactionEffect};
 use crate::utils::identifiers::quote_identifier;
-use crate::utils::pagination::build_paginated_query;
+use crate::utils::pagination::paginate_query;
 
 pub async fn test_connection(id: Value, params: &Value) -> Value {
     let conn = ConnectionParams::from_value(inner_params(params));
@@ -95,11 +95,14 @@ async fn exec_once(
     limit: Option<u32>,
     page: u32,
 ) -> Result<Value, QueryError> {
-    let paginated = limit.is_some() && sqlkind::supports_trailing_limit(query);
-    let (sql, page_size) = match limit {
-        Some(l) if paginated => (build_paginated_query(query, l, page), l),
-        _ => (query.to_string(), 0),
-    };
+    // Pagination rewrites the SQL, so it applies only to statements that read
+    // and whose text can be rewritten safely (see `utils::pagination`). Anything
+    // else is capped on this side instead.
+    let page_sql = limit
+        .filter(|_| sqlkind::supports_trailing_limit(query))
+        .and_then(|l| paginate_query(query, l, page).map(|sql| (sql, l)));
+    let paginated = page_sql.is_some();
+    let (sql, page_size) = page_sql.unwrap_or_else(|| (query.to_string(), 0));
     let manual_limit = if paginated { None } else { limit };
 
     let stmt = client.prepare(&sql).await?;
