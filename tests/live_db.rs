@@ -1111,3 +1111,644 @@ fn a_comment_only_or_broken_statement_is_not_rewritten() {
         "{err}"
     );
 }
+
+// ---- Phase 4: row editing (insert_record, update_record, delete_record) ----
+
+impl Plugin {
+    /// A call whose connection object is replaced (e.g. to add a connection URI).
+    fn call_with_connection(&mut self, method: &str, connection: Value, extra: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = json!({ "params": connection });
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(self.stdin, "{req}").unwrap();
+        let r = self.recv(20).expect("no response");
+        assert_eq!(r["id"], id, "{r}");
+        r
+    }
+}
+
+fn fresh_table(p: &mut Plugin, name: &str, ddl: &str) {
+    p.query(&format!("DROP TABLE IF EXISTS {name}"));
+    let r = p.query(&format!("CREATE TABLE {name} ({ddl})"));
+    assert!(r.get("error").is_none(), "{r}");
+}
+
+fn rows_of(p: &mut Plugin, sql: &str) -> Vec<Value> {
+    let r = p.query(sql);
+    assert!(r.get("error").is_none(), "{sql}: {r}");
+    r["result"]["rows"].as_array().unwrap().clone()
+}
+
+fn count(p: &mut Plugin, table: &str) -> i64 {
+    rows_of(p, &format!("SELECT count(*) FROM {table}"))[0][0]
+        .as_i64()
+        .unwrap()
+}
+
+#[test]
+fn crud_round_trip_with_a_big_int8_key_sent_as_a_string() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_c1",
+        "id INT8 PRIMARY KEY DEFAULT unique_rowid(), name STRING, price DECIMAL(10,2), active BOOL",
+    );
+
+    // Columns left out get their server default (unique_rowid()).
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_c1", "data": {"name": "Ann", "price": "12.50", "active": true}}),
+    );
+    assert_eq!(r["result"], 1, "the reply is the affected-row count: {r}");
+    let row = &rows_of(&mut p, "SELECT id, name, price, active FROM live_c1")[0];
+    let id = row[0]
+        .as_str()
+        .expect("a unique_rowid() key is above 2^53, so it travels as a string");
+    assert_eq!(
+        row.as_array().unwrap()[1..],
+        [json!("Ann"), json!("12.50"), json!(true)]
+    );
+
+    // The key goes back as the same string and finds the row exactly.
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c1", "pk_map": {"id": id}, "col_name": "name", "new_val": "Bob"}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(rows_of(&mut p, "SELECT name FROM live_c1")[0][0], "Bob");
+
+    let r = p.call(
+        "delete_record",
+        json!({"table": "live_c1", "pk_map": {"id": id}}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(count(&mut p, "live_c1"), 0);
+    p.query("DROP TABLE live_c1");
+}
+
+#[test]
+fn updating_a_row_that_no_longer_exists_is_a_conflict_not_success() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c2", "id INT8 PRIMARY KEY, name STRING");
+    p.query("INSERT INTO live_c2 VALUES (1, 'a')");
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c2", "pk_map": {"id": 999}, "col_name": "name", "new_val": "x"}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("row not found"),
+        "{r}"
+    );
+    // Deleting an already-deleted row is just 0 affected rows.
+    let r = p.call(
+        "delete_record",
+        json!({"table": "live_c2", "pk_map": {"id": 999}}),
+    );
+    assert_eq!(r["result"], 0, "{r}");
+    assert_eq!(count(&mut p, "live_c2"), 1);
+    p.query("DROP TABLE live_c2");
+}
+
+#[test]
+fn composite_keys_and_null_key_values() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_c3",
+        "a INT8, b STRING, v STRING, PRIMARY KEY (a, b)",
+    );
+    p.query("INSERT INTO live_c3 VALUES (1,'x','one-x'), (1,'y','one-y'), (2,'x','two-x')");
+    // Only the row matching BOTH key columns changes.
+    let r = p.call("update_record", json!({"table": "live_c3", "pk_map": {"a": 1, "b": "y"}, "col_name": "v", "new_val": "changed"}));
+    assert_eq!(r["result"], 1, "{r}");
+    let all = rows_of(&mut p, "SELECT a, b, v FROM live_c3 ORDER BY a, b");
+    assert_eq!(
+        all,
+        [
+            json!([1, "x", "one-x"]),
+            json!([1, "y", "changed"]),
+            json!([2, "x", "two-x"])
+        ]
+    );
+    let r = p.call(
+        "delete_record",
+        json!({"table": "live_c3", "pk_map": {"b": "x", "a": 2}}),
+    );
+    assert_eq!(r["result"], 1);
+    assert_eq!(count(&mut p, "live_c3"), 2);
+    p.query("DROP TABLE live_c3");
+
+    // A NULL key value matches with IS NULL, not `= NULL`.
+    fresh_table(&mut p, "live_c3n", "k STRING, v STRING");
+    p.query("INSERT INTO live_c3n VALUES (NULL, 'n'), ('a', 'a')");
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c3n", "pk_map": {"k": null}, "col_name": "v", "new_val": "was-null"}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT v FROM live_c3n WHERE k IS NULL")[0][0],
+        "was-null"
+    );
+    p.query("DROP TABLE live_c3n");
+}
+
+#[test]
+fn a_table_without_a_primary_key_is_edited_through_the_hidden_rowid() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c4", "name STRING, qty INT8");
+    p.call(
+        "insert_record",
+        json!({"table": "live_c4", "data": {"name": "a", "qty": 1}}),
+    );
+    p.call(
+        "insert_record",
+        json!({"table": "live_c4", "data": {"name": "b", "qty": 2}}),
+    );
+    let rows = rows_of(&mut p, "SELECT rowid, name FROM live_c4 ORDER BY name");
+    let rowid = rows[0][0].clone(); // `rowid` is above 2^53: a string
+    assert!(rowid.is_string(), "{rowid}");
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c4", "pk_map": {"rowid": rowid}, "col_name": "qty", "new_val": 99}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT name, qty FROM live_c4 ORDER BY name"),
+        [json!(["a", 99]), json!(["b", 2])]
+    );
+    p.query("DROP TABLE live_c4");
+}
+
+#[test]
+fn a_key_that_matches_several_rows_changes_nothing() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c5", "tag STRING, v STRING");
+    p.query("INSERT INTO live_c5 VALUES ('dup','a'), ('dup','b'), ('solo','c')");
+
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c5", "pk_map": {"tag": "dup"}, "col_name": "v", "new_val": "X"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("refusing to change 2 rows") && msg.contains("Nothing was changed"),
+        "{r}"
+    );
+    assert_eq!(
+        rows_of(&mut p, "SELECT count(*) FROM live_c5 WHERE v = 'X'")[0][0],
+        0,
+        "the update must be rolled back"
+    );
+
+    let r = p.call(
+        "delete_record",
+        json!({"table": "live_c5", "pk_map": {"tag": "dup"}}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to change 2 rows"),
+        "{r}"
+    );
+    assert_eq!(
+        count(&mut p, "live_c5"),
+        3,
+        "the delete must be rolled back"
+    );
+    p.query("DROP TABLE live_c5");
+}
+
+#[test]
+fn an_empty_row_key_can_never_touch_every_row() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c6", "id INT8 PRIMARY KEY, v STRING");
+    p.query("INSERT INTO live_c6 VALUES (1,'a'), (2,'b')");
+    for extra in [json!({"pk_map": {}}), json!({})] {
+        let mut upd = json!({"table": "live_c6", "col_name": "v", "new_val": "X"});
+        let mut del = json!({"table": "live_c6"});
+        for (k, v) in extra.as_object().unwrap() {
+            upd[k] = v.clone();
+            del[k] = v.clone();
+        }
+        let u = p.call("update_record", upd);
+        assert_eq!(u["error"]["code"], -32602, "{u}");
+        let d = p.call("delete_record", del);
+        assert_eq!(d["error"]["code"], -32602, "{d}");
+    }
+    assert_eq!(count(&mut p, "live_c6"), 2);
+    assert_eq!(
+        rows_of(&mut p, "SELECT count(*) FROM live_c6 WHERE v = 'X'")[0][0],
+        0
+    );
+    p.query("DROP TABLE live_c6");
+}
+
+#[test]
+fn unknown_tables_and_columns_are_reported_not_guessed() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c7", "id INT8 PRIMARY KEY, v STRING");
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_no_such_table", "data": {"a": 1}}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("was not found"),
+        "{r}"
+    );
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_c7", "data": {"nope": 1}}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("column \"nope\" does not exist"),
+        "{r}"
+    );
+    let r = p.call(
+        "update_record",
+        json!({"table": "live_c7", "pk_map": {"idd": 1}, "col_name": "v", "new_val": "x"}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("column \"idd\" does not exist"),
+        "{r}"
+    );
+    let r = p.call("insert_record", json!({}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    p.query("DROP TABLE live_c7");
+}
+
+#[test]
+fn every_value_type_survives_an_insert_and_a_read_back() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP TYPE IF EXISTS live_c8_mood");
+    p.query("CREATE TYPE live_c8_mood AS ENUM ('sad', 'happy')");
+    fresh_table(
+        &mut p,
+        "live_c8",
+        "id INT8 PRIMARY KEY, i2 INT2, d DECIMAL(30,3), f FLOAT8, b BOOL, s STRING, y BYTES, u UUID, j JSONB, \
+         ts TIMESTAMPTZ, iv INTERVAL, ip INET, a INT8[], sa STRING[], m live_c8_mood",
+    );
+    let blob = "BLOB:3:application/octet-stream:AAH/"; // bytes 0x00 0x01 0xFF
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_c8", "data": {
+            "id": "1152921504606846977", "i2": 7, "d": "123456789012345678901234567.890", "f": "Infinity", "b": "t",
+            "s": "it's \"quoted\"", "y": blob, "u": "DEADBEEF-0001-0203-0405-060708090A0B", "j": {"k": [1, 2]},
+            "ts": "2024-03-05T12:30:45.5Z", "iv": "1 day 02:00:00", "ip": "10.0.0.0/24",
+            "a": [1, null, 3], "sa": ["a b", "q\"x", "b\\s"], "m": "happy"}}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    let row = &rows_of(&mut p, "SELECT * FROM live_c8")[0];
+    assert_eq!(row[0], "1152921504606846977");
+    assert_eq!(row[1], 7);
+    assert_eq!(row[2], "123456789012345678901234567.890");
+    assert_eq!(row[3], "Infinity");
+    assert_eq!(row[4], true);
+    assert_eq!(row[5], "it's \"quoted\"");
+    assert!(row[6].as_str().unwrap().starts_with("BLOB:3:"));
+    assert_eq!(row[7], "deadbeef-0001-0203-0405-060708090a0b");
+    assert_eq!(row[8], json!({"k": [1, 2]}));
+    assert_eq!(row[9], "2024-03-05T12:30:45.5Z");
+    assert_eq!(row[10], "1 day 02:00:00");
+    assert_eq!(row[11], "10.0.0.0/24");
+    assert_eq!(row[12], json!([1, null, 3]));
+    assert_eq!(row[13], json!(["a b", "q\"x", "b\\s"]));
+    assert_eq!(row[14], "happy");
+
+    // The same types through update_record, keyed by the exact string key.
+    let key = json!({"id": "1152921504606846977"});
+    for (col, val, expect) in [
+        ("d", json!("0.001"), json!("0.001")),
+        ("m", json!("sad"), json!("sad")),
+        ("a", json!([9]), json!([9])),
+        ("j", json!("{\"x\": true}"), json!({"x": true})),
+        ("b", json!(false), json!(false)),
+        ("s", Value::Null, Value::Null),
+    ] {
+        let r = p.call(
+            "update_record",
+            json!({"table": "live_c8", "pk_map": key, "col_name": col, "new_val": val}),
+        );
+        assert_eq!(r["result"], 1, "{col}: {r}");
+        assert_eq!(
+            rows_of(&mut p, &format!("SELECT {col} FROM live_c8"))[0][0],
+            expect,
+            "{col}"
+        );
+    }
+    p.query("DROP TABLE live_c8");
+    p.query("DROP TYPE live_c8_mood");
+}
+
+#[test]
+fn the_default_sentinel_resets_a_column_to_its_default() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_c9",
+        "id INT8 PRIMARY KEY, status STRING DEFAULT 'new'",
+    );
+    p.query("INSERT INTO live_c9 VALUES (1, 'old')");
+    let r = p.call("update_record", json!({"table": "live_c9", "pk_map": {"id": 1}, "col_name": "status", "new_val": "__USE_DEFAULT__"}));
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(rows_of(&mut p, "SELECT status FROM live_c9")[0][0], "new");
+    // An insert with no columns takes every default.
+    p.call(
+        "insert_record",
+        json!({"table": "live_c9", "data": {"id": 2}}),
+    );
+    assert_eq!(
+        rows_of(&mut p, "SELECT status FROM live_c9 WHERE id = 2")[0][0],
+        "new"
+    );
+    p.query("DROP TABLE live_c9");
+}
+
+#[test]
+fn edits_work_on_a_connection_that_defaults_to_read_only() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_c10", "id INT8 PRIMARY KEY, v STRING");
+    let (host, port) = live_node().unwrap();
+    let uri = format!("cockroachdb://root@{host}:{port}/defaultdb?sslmode=disable&options=-c%20default_transaction_read_only%3Don");
+    let mut conn = p.conn();
+    conn["params"]["connection_uri"] = json!(uri);
+    let connection = conn["params"].clone();
+
+    // Proof the setup is real: a plain statement is refused by the server.
+    let plain = p.call_with_connection(
+        "execute_query",
+        connection.clone(),
+        json!({"query": "INSERT INTO live_c10 VALUES (1, 'x')"}),
+    );
+    assert!(
+        plain["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("25006"),
+        "{plain}"
+    );
+
+    // A driver-owned `BEGIN READ WRITE` transaction still saves the edit.
+    let r = p.call_with_connection(
+        "insert_record",
+        connection.clone(),
+        json!({"table": "live_c10", "data": {"id": 1, "v": "a"}}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    let r = p.call_with_connection(
+        "update_record",
+        connection.clone(),
+        json!({"table": "live_c10", "pk_map": {"id": 1}, "col_name": "v", "new_val": "b"}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    let r = p.call_with_connection(
+        "delete_record",
+        connection,
+        json!({"table": "live_c10", "pk_map": {"id": 1}}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    p.query("DROP TABLE live_c10");
+}
+
+#[test]
+fn a_failed_write_leaves_the_connection_clean_for_the_next_one() {
+    // One connection in the pool: if a failure left a transaction open, the
+    // next edit would fail or run inside it.
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    fresh_table(&mut p, "live_c11", "id INT8 PRIMARY KEY, v STRING NOT NULL");
+    p.call(
+        "insert_record",
+        json!({"table": "live_c11", "data": {"id": 1, "v": "a"}}),
+    );
+    let dup = p.call(
+        "insert_record",
+        json!({"table": "live_c11", "data": {"id": 1, "v": "b"}}),
+    );
+    assert!(
+        dup["error"]["message"].as_str().unwrap().contains("23505"),
+        "{dup}"
+    );
+    let null = p.call(
+        "insert_record",
+        json!({"table": "live_c11", "data": {"id": 2, "v": null}}),
+    );
+    assert!(
+        null["error"]["message"].as_str().unwrap().contains("23502"),
+        "{null}"
+    );
+    let bad = p.call(
+        "insert_record",
+        json!({"table": "live_c11", "data": {"id": "not-a-number", "v": "z"}}),
+    );
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+
+    let ok = p.call(
+        "insert_record",
+        json!({"table": "live_c11", "data": {"id": 3, "v": "c"}}),
+    );
+    assert_eq!(ok["result"], 1, "{ok}");
+    assert_eq!(count(&mut p, "live_c11"), 2);
+    p.query("DROP TABLE live_c11");
+}
+
+#[test]
+fn the_schema_defaults_to_the_current_one_and_can_be_named() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP SCHEMA IF EXISTS live_c12s CASCADE");
+    p.query("CREATE SCHEMA live_c12s");
+    p.query("CREATE TABLE live_c12s.t (id INT8 PRIMARY KEY, v STRING)");
+    let r = p.call(
+        "insert_record",
+        json!({"table": "t", "schema": "live_c12s", "data": {"id": 1, "v": "in-schema"}}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT v FROM live_c12s.t")[0][0],
+        "in-schema"
+    );
+    // Without a schema the table is looked up in `public`, where `t` does not exist.
+    let r = p.call("insert_record", json!({"table": "t", "data": {"id": 2}}));
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("was not found"),
+        "{r}"
+    );
+    p.query("DROP SCHEMA live_c12s CASCADE");
+}
+
+// ---- BLOBs ----------------------------------------------------------------
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("live-blob-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(name)
+}
+
+#[test]
+fn blob_cells_can_be_previewed_and_saved_to_a_file() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_b1",
+        "id INT8 PRIMARY KEY, data BYTES, label STRING",
+    );
+    let png = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+    let b64 = base64_of(&png);
+    let wire = format!("BLOB:{}:image/png:{b64}", png.len());
+    p.call(
+        "insert_record",
+        json!({"table": "live_b1", "data": {"id": 1, "data": wire, "label": "pic"}}),
+    );
+    p.call(
+        "insert_record",
+        json!({"table": "live_b1", "data": {"id": 2, "label": "no data"}}),
+    );
+
+    let r = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b1", "col_name": "data", "pk_map": {"id": 1}}),
+    );
+    assert_eq!(
+        r["result"],
+        format!("BLOB:{}:image/png:{b64}", png.len()),
+        "{r}"
+    );
+
+    let path = temp_path("out.png");
+    let r = p.call("save_blob_to_file", json!({"table": "live_b1", "col_name": "data", "pk_map": {"id": 1}, "file_path": path.display().to_string()}));
+    assert!(r.get("error").is_none() && r["result"].is_null(), "{r}");
+    assert_eq!(std::fs::read(&path).unwrap(), png);
+
+    // Failure modes name the problem.
+    let e = |r: &Value| {
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let null = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b1", "col_name": "data", "pk_map": {"id": 2}}),
+    );
+    assert!(e(&null).contains("is NULL"), "{null}");
+    let missing = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b1", "col_name": "data", "pk_map": {"id": 99}}),
+    );
+    assert!(e(&missing).contains("row not found"), "{missing}");
+    let not_bytes = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b1", "col_name": "label", "pk_map": {"id": 1}}),
+    );
+    assert!(e(&not_bytes).contains("not BYTES"), "{not_bytes}");
+    let no_key = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b1", "col_name": "data", "pk_map": {}}),
+    );
+    assert_eq!(no_key["error"]["code"], -32602, "{no_key}");
+    let bad_path = p.call("save_blob_to_file", json!({"table": "live_b1", "col_name": "data", "pk_map": {"id": 1}, "file_path": "/no/such/dir/x.bin"}));
+    assert!(e(&bad_path).contains("does not exist"), "{bad_path}");
+    p.query("DROP TABLE live_b1");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_picked_file_is_stored_as_bytes_and_respects_the_size_cap() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_b2", "id INT8 PRIMARY KEY, data BYTES");
+    let file = temp_path("upload.bin");
+    let content: Vec<u8> = (0..=255u8).collect();
+    std::fs::write(&file, &content).unwrap();
+    let file_ref = format!(
+        "BLOB_FILE_REF:{}:application/octet-stream:{}",
+        content.len(),
+        file.display()
+    );
+
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_b2", "data": {"id": 1, "data": file_ref}, "max_blob_size": 1024}),
+    );
+    assert_eq!(r["result"], 1, "{r}");
+    let back = p.call(
+        "fetch_blob_as_data_url",
+        json!({"table": "live_b2", "col_name": "data", "pk_map": {"id": 1}}),
+    );
+    assert!(
+        back["result"].as_str().unwrap().starts_with("BLOB:256:"),
+        "{back}"
+    );
+
+    // Over the host's cap: refused, and nothing is stored (not even the path as text).
+    let r = p.call(
+        "insert_record",
+        json!({"table": "live_b2", "data": {"id": 2, "data": file_ref}, "max_blob_size": 100}),
+    );
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("exceeds"),
+        "{r}"
+    );
+    // Update from a picked file too.
+    let r = p.call("update_record", json!({"table": "live_b2", "pk_map": {"id": 1}, "col_name": "data", "new_val": file_ref, "max_blob_size": 1024}));
+    assert_eq!(r["result"], 1, "{r}");
+    assert_eq!(count(&mut p, "live_b2"), 1);
+    let missing = p.call(
+        "insert_record",
+        json!({"table": "live_b2", "data": {"id": 3, "data": "BLOB_FILE_REF:1:x/y:/no/such/file"}}),
+    );
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot read"),
+        "{missing}"
+    );
+    assert_eq!(count(&mut p, "live_b2"), 1);
+    p.query("DROP TABLE live_b2");
+    let _ = std::fs::remove_file(file);
+}
+
+/// Standard base64, enough for test data (no dependency in the test crate).
+fn base64_of(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let n = u32::from(chunk[0]) << 16
+            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}

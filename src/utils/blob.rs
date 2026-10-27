@@ -33,6 +33,44 @@ pub fn encode_blob_full(data: &[u8]) -> String {
     )
 }
 
+/// Default cap on a BLOB file read into memory (100 MiB), the host's default.
+/// The host sends its configured `maxBlobSize` with every write.
+pub const DEFAULT_MAX_BLOB_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Read the file named by `BLOB_FILE_REF:<size>:<mime>:<path>`, the form the
+/// host sends when a user picks a file for a BYTES cell. Larger files are
+/// refused before they are read, so a huge pick cannot exhaust memory.
+pub fn resolve_blob_file_ref(value: &str, max_size: u64) -> Result<Vec<u8>, String> {
+    let rest = value
+        .strip_prefix("BLOB_FILE_REF:")
+        .ok_or("not a BLOB_FILE_REF")?;
+    let mut parts = rest.splitn(3, ':');
+    let (size, _mime, path) = (parts.next(), parts.next(), parts.next());
+    let (Some(size), Some(path)) = (size, path) else {
+        return Err("invalid BLOB_FILE_REF format".into());
+    };
+    let declared: u64 = size
+        .parse()
+        .map_err(|_| "invalid file size in BLOB_FILE_REF")?;
+    if declared > max_size {
+        return Err(format!(
+            "file size ({declared} bytes) exceeds the maximum allowed size ({max_size} bytes / {} MB); choose a smaller file",
+            max_size / (1024 * 1024)
+        ));
+    }
+    // The declared size comes from the host; check the file itself as well.
+    let on_disk = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read BLOB file '{path}': {e}"))?
+        .len();
+    if on_disk > max_size {
+        return Err(format!(
+            "file size ({on_disk} bytes) exceeds the maximum allowed size ({max_size} bytes / {} MB); choose a smaller file",
+            max_size / (1024 * 1024)
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("cannot read BLOB file '{path}': {e}"))
+}
+
 /// Decode the wire format back to bytes. `None` when `value` is not in that
 /// format, so callers can treat it as a plain string.
 pub fn decode_blob(value: &str) -> Option<Vec<u8>> {
@@ -71,6 +109,58 @@ mod tests {
             decode_blob(&encode_blob_full(&big)).unwrap().len(),
             big.len()
         );
+    }
+
+    #[test]
+    fn reads_a_blob_file_ref() {
+        let dir = std::env::temp_dir().join(format!("blobref-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.bin");
+        std::fs::write(&file, [9u8, 8, 7]).unwrap();
+        let value = format!(
+            "BLOB_FILE_REF:3:application/octet-stream:{}",
+            file.display()
+        );
+        assert_eq!(resolve_blob_file_ref(&value, 100).unwrap(), vec![9, 8, 7]);
+        // A path may itself contain ':'.
+        let colon = dir.join("a:b.bin");
+        std::fs::write(&colon, [1u8]).unwrap();
+        let value = format!("BLOB_FILE_REF:1:x/y:{}", colon.display());
+        assert_eq!(resolve_blob_file_ref(&value, 100).unwrap(), vec![1]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_oversized_missing_and_malformed_file_refs() {
+        let dir = std::env::temp_dir().join(format!("blobref-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.bin");
+        std::fs::write(&file, vec![0u8; 50]).unwrap();
+        // Declared size over the cap: refused before reading.
+        let declared = format!("BLOB_FILE_REF:5000:x/y:{}", file.display());
+        assert!(resolve_blob_file_ref(&declared, 100)
+            .unwrap_err()
+            .contains("exceeds"));
+        // Declared small, actually large: the file itself is checked.
+        let lying = format!("BLOB_FILE_REF:1:x/y:{}", file.display());
+        assert!(resolve_blob_file_ref(&lying, 10)
+            .unwrap_err()
+            .contains("exceeds"));
+        assert!(
+            resolve_blob_file_ref("BLOB_FILE_REF:1:x/y:/no/such/file", 100)
+                .unwrap_err()
+                .contains("cannot read")
+        );
+        for bad in [
+            "BLOB_FILE_REF:",
+            "BLOB_FILE_REF:1",
+            "BLOB_FILE_REF:1:x",
+            "BLOB_FILE_REF:abc:x:/p",
+            "BLOB:1:x:AA==",
+        ] {
+            assert!(resolve_blob_file_ref(bad, 100).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

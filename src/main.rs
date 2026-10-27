@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 mod binding;
 mod cancel;
 mod client;
+mod crud;
 mod error;
 mod extract;
 mod handlers;
