@@ -46,16 +46,18 @@ Each phase ends with a release on the `alpha` channel. A capability flag in
 `.tabularium` already declares the target behavior, so a flag whose handlers
 are not done yet shows errors in the UI. That is expected during the alpha.
 
-| Phase | Scope | Documents |
-| --- | --- | --- |
-| 1. Connect | Pool, TLS, URI parsing, `test_connection`, version detection | 01 |
-| 2. Browse | Databases, schemas, tables, columns, PKs, FKs, indexes, views, DDL text | 02, 03 |
-| 3. Query | `execute_query`, batches, sessions, cancellation, retries | 05, 03 |
-| 4. Edit | `insert_record`, `update_record`, `delete_record`, BLOBs | 07, 03 |
-| 5. DDL | Create/alter table, column, index, FK, comments, drops | 04 |
-| 6. Plans | `explain_query` with the text-tree parser | 06 |
-| 7. Extras | Materialized views, sequences, routines, multi-region metadata, schema snapshot | 02, 04 |
-| 8. Release | Live tests on the CI matrix, screenshots, `1.0.0` | 09 |
+| Phase | Scope | Documents | Status |
+| --- | --- | --- | --- |
+| 1. Connect | Pool, TLS, URI parsing, `test_connection`, version detection | 01 | Done |
+| 2. Browse | Databases, schemas, tables, columns, PKs, FKs, indexes, views, DDL text | 02, 03 | Done |
+| 3. Query | `execute_query`, batches, sessions, cancellation, retries | 05, 03 | Done |
+| 4. Edit | `insert_record`, `update_record`, `delete_record`, BLOBs | 07, 03 | Done |
+| 5. DDL | Create/alter table, column, index, FK, comments, drops | 04 | To do |
+| 6. Plans | `explain_query` with the text-tree parser | 06 | To do |
+| 7. Extras | Materialized views, sequences, routines, multi-region metadata, schema snapshot | 02, 04 | To do |
+| 8. Release | Live tests on the CI matrix, screenshots, `1.0.0` | 09 | In progress (`0.1.0-alpha.1`) |
+
+Phases 5 and 6 are tracked in issue #16.
 
 ## Starting point
 
