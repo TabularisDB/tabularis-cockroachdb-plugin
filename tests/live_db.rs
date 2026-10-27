@@ -956,3 +956,141 @@ fn set_config_does_not_leak_when_no_schema_masks_it() {
     let r = p.call("execute_query", json!({"query": "SHOW application_name"}));
     assert_eq!(r["result"]["rows"][0][0], "tabularis", "{r}");
 }
+
+// ---- Regression: pagination must understand comments, strings and clauses --
+
+/// The first column of every row, or the error text.
+fn page_of(
+    p: &mut Plugin,
+    query: &str,
+    limit: u64,
+    page: u64,
+) -> Result<(Vec<Value>, bool), String> {
+    let r = p.call(
+        "execute_query",
+        json!({"query": query, "limit": limit, "page": page, "schema": "public"}),
+    );
+    if let Some(e) = r.get("error") {
+        return Err(e["message"].as_str().unwrap().to_string());
+    }
+    let res = &r["result"];
+    let rows = res["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[0].clone())
+        .collect();
+    Ok((rows, res["pagination"]["has_more"] == true))
+}
+
+fn ints(from: i64, to: i64) -> Vec<Value> {
+    (from..=to).map(|n| json!(n)).collect()
+}
+
+#[test]
+fn a_trailing_line_comment_does_not_make_page_two_repeat_page_one() {
+    let Some(mut p) = Plugin::start() else { return };
+    // The reported case: no newline after the comment.
+    let q = "SELECT generate_series(1,25) AS n ORDER BY 1 -- note";
+    assert_eq!(page_of(&mut p, q, 10, 1).unwrap(), (ints(1, 10), true));
+    assert_eq!(
+        page_of(&mut p, q, 10, 2).unwrap(),
+        (ints(11, 20), true),
+        "page 2 must advance"
+    );
+    assert_eq!(page_of(&mut p, q, 10, 3).unwrap(), (ints(21, 25), false));
+}
+
+#[test]
+fn a_block_comment_after_a_user_limit_is_accepted_and_the_limit_still_caps() {
+    let Some(mut p) = Plugin::start() else { return };
+    // The reported case: used to fail with SQLSTATE 42601.
+    let q = "SELECT generate_series(1,25) AS n ORDER BY 1 LIMIT 2 /* note */";
+    assert_eq!(page_of(&mut p, q, 10, 1).unwrap(), (ints(1, 2), false));
+    // The user's LIMIT caps the total across pages.
+    let q = "SELECT generate_series(1,25) AS n ORDER BY 1 LIMIT 12 /* note */";
+    assert_eq!(page_of(&mut p, q, 10, 1).unwrap(), (ints(1, 10), true));
+    assert_eq!(page_of(&mut p, q, 10, 2).unwrap(), (ints(11, 12), false));
+}
+
+#[test]
+fn comments_with_a_limit_and_offset_in_every_position() {
+    let Some(mut p) = Plugin::start() else { return };
+    let base = "SELECT generate_series(1,25) AS n ORDER BY 1";
+    let cases = [
+        format!("{base} LIMIT 5 -- cap"),
+        format!("{base} LIMIT 5 /* cap */"),
+        format!("{base} LIMIT /* c */ 5"),
+        format!("{base} /* a */ LIMIT 5 /* b */"),
+        format!("{base} LIMIT 5 -- cap\n"),
+        format!("{base} LIMIT 5; -- cap"),
+    ];
+    for q in &cases {
+        assert_eq!(
+            page_of(&mut p, q, 10, 1).unwrap(),
+            (ints(1, 5), false),
+            "{q}"
+        );
+    }
+    let q = format!("{base} LIMIT 5 OFFSET 3 /* skip */");
+    assert_eq!(page_of(&mut p, &q, 10, 1).unwrap(), (ints(4, 8), false));
+    // A trailing comment with a user OFFSET, page 2.
+    let q = format!("{base} OFFSET 3 -- skip");
+    assert_eq!(page_of(&mut p, &q, 10, 2).unwrap(), (ints(14, 23), true));
+}
+
+#[test]
+fn strings_and_quoted_identifiers_containing_limit_are_preserved() {
+    let Some(mut p) = Plugin::start() else { return };
+    let q = "SELECT 'LIMIT 5 -- not a clause' AS \"limit\", generate_series(1,25) AS n ORDER BY 2";
+    let r = p.call("execute_query", json!({"query": q, "limit": 10, "page": 2}));
+    assert!(r.get("error").is_none(), "{r}");
+    let rows = r["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0], json!(["LIMIT 5 -- not a clause", 11]));
+    assert_eq!(r["result"]["columns"][0], "limit");
+}
+
+#[test]
+fn clauses_the_scanner_cannot_read_fall_back_to_wrapping_and_still_page() {
+    let Some(mut p) = Plugin::start() else { return };
+    for tail in ["LIMIT ALL", "FETCH FIRST 100 ROWS ONLY", "OFFSET 0 ROWS"] {
+        let q = format!("SELECT generate_series(1,25) AS n ORDER BY 1 {tail}");
+        assert_eq!(
+            page_of(&mut p, &q, 10, 1).unwrap(),
+            (ints(1, 10), true),
+            "{tail}"
+        );
+        assert_eq!(
+            page_of(&mut p, &q, 10, 2).unwrap(),
+            (ints(11, 20), true),
+            "page 2 must advance: {tail}"
+        );
+        assert_eq!(
+            page_of(&mut p, &q, 10, 3).unwrap(),
+            (ints(21, 25), false),
+            "{tail}"
+        );
+    }
+    // A trailing comment on a wrapped statement cannot reach the outer clause.
+    let q = "SELECT generate_series(1,25) AS n ORDER BY 1 LIMIT ALL -- note";
+    assert_eq!(page_of(&mut p, q, 10, 2).unwrap(), (ints(11, 20), true));
+}
+
+#[test]
+fn a_limit_inside_a_subquery_is_not_the_users_limit() {
+    let Some(mut p) = Plugin::start() else { return };
+    let q = "SELECT n FROM (SELECT generate_series(1,25) AS n LIMIT 15) AS s ORDER BY n";
+    assert_eq!(page_of(&mut p, q, 10, 2).unwrap(), (ints(11, 15), false));
+}
+
+#[test]
+fn a_comment_only_or_broken_statement_is_not_rewritten() {
+    let Some(mut p) = Plugin::start() else { return };
+    // An unterminated comment must still be an error, not silently "fixed".
+    let err = page_of(&mut p, "SELECT 1 /* never closed", 10, 1).unwrap_err();
+    assert!(
+        err.to_lowercase().contains("comment") || err.contains("SQLSTATE"),
+        "{err}"
+    );
+}

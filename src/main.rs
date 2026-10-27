@@ -26,6 +26,7 @@ mod rpc;
 mod session;
 mod settings;
 mod sqlkind;
+mod sqlscan;
 mod tls;
 mod utils;
 mod version;

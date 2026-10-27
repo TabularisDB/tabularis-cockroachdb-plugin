@@ -1,122 +1,151 @@
-//! Pagination math for LIMIT/OFFSET queries.
+//! Pagination: turn a statement plus a host `limit` / `page` into the SQL for
+//! that page.
 //!
-//! `build_paginated_query` mirrors the builtin driver's behavior in
-//! `src-tauri/src/drivers/common/query.rs`: strip any trailing user-supplied
-//! `LIMIT`/`OFFSET`, honor the user's LIMIT as a cap across pages, and append
-//! the plugin's own pagination clause. ORDER BY is left in place (not wrapped
-//! in a subquery) so table-qualified column references stay valid.
+//! The statement is read with `sqlscan`, so a comment, a string literal or a
+//! quoted identifier is never mistaken for a `LIMIT` and never swallows the
+//! clause that is appended:
 //!
-//! This is a simpler whitespace/token scan than the builtin's full quote- and
-//! comment-aware tokenizer — it correctly handles the common case (a plain
-//! trailing `LIMIT n` / `LIMIT n OFFSET m`) but does not defend against SQL
-//! comments after the clause or identifiers that literally are `LIMIT`/`OFFSET`
-//! tokens inside quotes. Sufficient for the current parity test corpus;
-//! revisit if a query pattern breaks this.
+//! - a trailing `-- note` would comment out an appended `LIMIT`, so page 2
+//!   would repeat page 1;
+//! - a trailing `/* note */` after the user's own `LIMIT` would hide it, so a
+//!   second `LIMIT` was appended and the server rejected the SQL.
+//!
+//! Trailing comments and semicolons are cut before the clause is added.
+//!
+//! Two forms are tried, in order:
+//!
+//! 1. Append `LIMIT n+1 OFFSET m` to the statement itself, after removing its
+//!    own trailing `LIMIT` / `OFFSET` (a user `LIMIT` still caps the total
+//!    across pages). `ORDER BY` stays in place, so table-qualified columns
+//!    stay valid. The extra row tells the host there is another page.
+//! 2. When the statement has a limit-like clause this module cannot read
+//!    (`LIMIT ALL`, `LIMIT $1`, `FETCH FIRST ... ROWS ONLY`, `OFFSET n ROWS`),
+//!    wrap it: `SELECT * FROM (<statement>) AS t LIMIT n+1 OFFSET m`. Without
+//!    this, page 2 of such a query would repeat page 1.
+//!
+//! `None` means the statement cannot be rewritten safely (an unterminated
+//! string or comment, or several statements); the caller then caps the rows on
+//! its own side instead of changing the SQL.
+
+use crate::sqlscan::{scan, Kind, Token};
 
 /// Compute the SQL LIMIT and OFFSET for a given page and page size.
 /// Pages are 1-indexed.
 pub fn limit_offset(page: u32, page_size: u32) -> (u32, u32) {
-    let offset = (page.saturating_sub(1)) * page_size;
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
     (page_size, offset)
 }
 
-/// Split a query into whitespace-separated tokens, tracking each token's
-/// starting byte offset in the original string.
-fn tokenize_with_pos(sql: &str) -> Vec<(&str, usize)> {
-    let mut tokens = Vec::new();
-    let mut idx = 0;
-    for part in sql.split_whitespace() {
-        // Find this token's actual position (split_whitespace doesn't give us
-        // offsets directly).
-        let start = sql[idx..].find(part).map(|p| idx + p).unwrap_or(idx);
-        idx = start + part.len();
-        tokens.push((part, start));
+/// The code tokens of a statement (comments dropped) and how many of them
+/// remain once trailing semicolons are removed. `None` if the text is not
+/// completely tokenized, or holds more than one statement.
+fn code_tokens(query: &str) -> Option<(Vec<Token>, usize)> {
+    let scanned = scan(query);
+    if !scanned.complete {
+        return None;
     }
-    tokens
+    let code: Vec<Token> = scanned
+        .tokens
+        .into_iter()
+        .filter(|t| t.kind != Kind::Comment)
+        .collect();
+    let mut end = code.len();
+    while end > 0 && code[end - 1].kind == Kind::Semi {
+        end -= 1;
+    }
+    if code[..end].iter().any(|t| t.kind == Kind::Semi) {
+        return None;
+    }
+    Some((code, end))
 }
 
-/// Strip a trailing `LIMIT <n>` and/or `OFFSET <n>` clause from the query,
-/// returning the query text with that clause removed.
-fn strip_limit_offset(query: &str) -> String {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let mut end = tokens.len();
-
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "OFFSET"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
+fn digits(kind: &Kind) -> Option<&str> {
+    match kind {
+        Kind::Word(w) if !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()) => Some(w),
+        _ => None,
     }
-
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "LIMIT"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
-    }
-
-    if end == tokens.len() {
-        return trimmed.to_string();
-    }
-
-    trimmed[..tokens[end].1].trim_end().to_string()
 }
 
-/// Extract the numeric value from a trailing `LIMIT` clause, if present.
-fn extract_user_limit(query: &str) -> Option<u32> {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let len = tokens.len();
-
-    let mut end = len;
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "OFFSET"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
-    }
-
-    if end >= 2 && tokens[end - 2].0.to_uppercase() == "LIMIT" {
-        return tokens[end - 1].0.parse().ok();
-    }
-
-    None
-}
-
-/// Extract the numeric value from a trailing `OFFSET` clause, if present.
-fn extract_user_offset(query: &str) -> Option<u32> {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let end = tokens.len();
-
-    if end >= 2 && tokens[end - 2].0.to_uppercase() == "OFFSET" {
-        return tokens[end - 1].0.parse().ok();
-    }
-
-    None
-}
-
-/// Build a paginated query: strip any user-supplied LIMIT/OFFSET and append
-/// this page's clause. A user LIMIT caps the total rows returned across all
-/// pages; a user OFFSET is added to the per-page offset.
-pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
-    let page_offset = limit_offset(page, page_size).1;
-    let user_limit = extract_user_limit(query);
-    let user_offset = extract_user_offset(query).unwrap_or(0);
-    let base = strip_limit_offset(query);
-
-    let fetch_count = match user_limit {
-        Some(ul) => {
-            let remaining = ul.saturating_sub(page_offset);
-            remaining.min(page_size + 1)
+/// A `LIMIT` / `OFFSET` / `FETCH` keyword at the top level of the tokens.
+fn has_top_level_limit_keyword(tokens: &[Token]) -> bool {
+    let mut depth = 0usize;
+    tokens.iter().any(|t| match &t.kind {
+        Kind::Open => {
+            depth += 1;
+            false
         }
-        None => page_size + 1,
+        Kind::Close => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        Kind::Word(w) => depth == 0 && matches!(w.as_str(), "LIMIT" | "OFFSET" | "FETCH"),
+        _ => false,
+    })
+}
+
+/// Form 1: the statement with its own trailing `LIMIT n` / `OFFSET n`
+/// replaced by this page's clause.
+pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> Option<String> {
+    let (code, mut cut) = code_tokens(query)?;
+
+    // Trailing `LIMIT n` and `OFFSET n`, in either order, each at most once.
+    let (mut user_limit, mut user_offset) = (None::<u32>, None::<u32>);
+    while cut >= 2 {
+        let (Kind::Word(keyword), Some(number)) =
+            (&code[cut - 2].kind, digits(&code[cut - 1].kind))
+        else {
+            break;
+        };
+        let slot = match keyword.as_str() {
+            "LIMIT" => &mut user_limit,
+            "OFFSET" => &mut user_offset,
+            _ => break,
+        };
+        if slot.is_some() {
+            break;
+        }
+        // A value too large for u32 cannot be combined with the page offset.
+        *slot = Some(number.parse().ok()?);
+        cut -= 2;
+    }
+
+    // Anything limit-like left at the top level is a form we cannot read.
+    if cut == 0 || has_top_level_limit_keyword(&code[..cut]) {
+        return None;
+    }
+    let base = &query[..code[cut - 1].end];
+
+    let page_offset = limit_offset(page, page_size).1;
+    let fetch_count = match user_limit {
+        Some(user) => user
+            .saturating_sub(page_offset)
+            .min(page_size.saturating_add(1)),
+        None => page_size.saturating_add(1),
     };
+    let offset = user_offset.unwrap_or(0).saturating_add(page_offset);
+    Some(format!("{base} LIMIT {fetch_count} OFFSET {offset}"))
+}
 
-    let offset = user_offset.saturating_add(page_offset);
+/// Form 2: the whole statement as a subquery. The statement goes on its own
+/// lines, so a comment inside it cannot reach the clause that follows.
+pub fn wrap_paginated_query(query: &str, page_size: u32, page: u32) -> Option<String> {
+    let (code, end) = code_tokens(query)?;
+    if end == 0 {
+        return None;
+    }
+    let inner = &query[..code[end - 1].end];
+    let (_, offset) = limit_offset(page, page_size);
+    Some(format!(
+        "SELECT * FROM (\n{inner}\n) AS tabularis_page LIMIT {} OFFSET {offset}",
+        page_size.saturating_add(1)
+    ))
+}
 
-    format!("{} LIMIT {} OFFSET {}", base, fetch_count, offset)
+/// The SQL for one page, trying [`build_paginated_query`] and then
+/// [`wrap_paginated_query`]. `None` when the statement cannot be rewritten.
+pub fn paginate_query(query: &str, page_size: u32, page: u32) -> Option<String> {
+    build_paginated_query(query, page_size, page)
+        .or_else(|| wrap_paginated_query(query, page_size, page))
 }
 
 #[cfg(test)]

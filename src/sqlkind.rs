@@ -62,8 +62,8 @@ fn first_keyword(query: &str) -> Option<String> {
 
 /// A token of a SQL statement, reduced to what is needed to find the main
 /// statement of a `WITH` query. Strings, quoted identifiers, dollar quotes and
-/// comments are skipped as opaque tokens, so their contents (parentheses,
-/// `INSERT`, `;`) can never be mistaken for syntax.
+/// comments are skipped as opaque tokens (see `sqlscan`), so their contents
+/// (parentheses, `INSERT`, `;`) can never be mistaken for syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
     /// A bare word, uppercased (`SELECT`, `src`, `AS`, ...).
@@ -79,126 +79,21 @@ enum Tok {
 }
 
 fn tokenize(sql: &str) -> Vec<Tok> {
-    let chars: Vec<char> = sql.chars().collect();
-    let mut toks = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            c if c.is_whitespace() => i += 1,
-            '-' if chars.get(i + 1) == Some(&'-') => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            '/' if chars.get(i + 1) == Some(&'*') => {
-                let mut depth = 1;
-                i += 2;
-                while i < chars.len() && depth > 0 {
-                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            '\'' => {
-                // `E'...'` strings also escape with a backslash.
-                let escaped = i > 0
-                    && matches!(chars[i - 1], 'e' | 'E')
-                    && (i < 2 || !(chars[i - 2].is_ascii_alphanumeric() || chars[i - 2] == '_'));
-                i += 1;
-                while i < chars.len() {
-                    if escaped && chars[i] == '\\' {
-                        i += 2;
-                    } else if chars[i] == '\'' {
-                        if chars.get(i + 1) == Some(&'\'') {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                // An `E` directly before the quote belongs to the literal.
-                if matches!(toks.last(), Some(Tok::Word(w)) if (w == "E") && escaped) {
-                    toks.pop();
-                }
-                toks.push(Tok::Str);
-            }
-            '"' => {
-                i += 1;
-                while i < chars.len() {
-                    if chars[i] == '"' {
-                        if chars.get(i + 1) == Some(&'"') {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                toks.push(Tok::Quoted);
-            }
-            '$' => {
-                // `$tag$ ... $tag$` (tag may be empty). `$1` is a placeholder.
-                let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-                    j += 1;
-                }
-                let tag_ok = j > i + 1 && !chars[i + 1].is_ascii_digit() || j == i + 1;
-                if tag_ok && chars.get(j) == Some(&'$') {
-                    let delim: String = chars[i..=j].iter().collect();
-                    let rest: String = chars[j + 1..].iter().collect();
-                    i = match rest.find(&delim) {
-                        Some(at) => j + 1 + rest[..at].chars().count() + delim.chars().count(),
-                        None => chars.len(),
-                    };
-                    toks.push(Tok::Str);
-                } else {
-                    i += 1;
-                    toks.push(Tok::Other);
-                }
-            }
-            '(' => {
-                i += 1;
-                toks.push(Tok::Open);
-            }
-            ')' => {
-                i += 1;
-                toks.push(Tok::Close);
-            }
-            ',' => {
-                i += 1;
-                toks.push(Tok::Comma);
-            }
-            c if c.is_ascii_alphanumeric() || c == '_' => {
-                let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                toks.push(Tok::Word(
-                    chars[start..i]
-                        .iter()
-                        .collect::<String>()
-                        .to_ascii_uppercase(),
-                ));
-            }
-            _ => {
-                i += 1;
-                toks.push(Tok::Other);
-            }
-        }
-    }
-    toks
+    use crate::sqlscan::{scan, Kind};
+    scan(sql)
+        .tokens
+        .into_iter()
+        .filter_map(|t| match t.kind {
+            Kind::Comment => None,
+            Kind::Word(w) => Some(Tok::Word(w)),
+            Kind::Quoted => Some(Tok::Quoted),
+            Kind::Str => Some(Tok::Str),
+            Kind::Open => Some(Tok::Open),
+            Kind::Close => Some(Tok::Close),
+            Kind::Comma => Some(Tok::Comma),
+            Kind::Semi | Kind::Other => Some(Tok::Other),
+        })
+        .collect()
 }
 
 /// Index just past the balanced `( ... )` group that opens at `toks[at]`.
