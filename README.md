@@ -32,17 +32,21 @@ wire protocol, but its catalog, type system, DDL, transaction model, and
 `EXPLAIN` output differ from PostgreSQL in ways that a plain PostgreSQL driver
 gets wrong. This plugin handles those differences natively.
 
-> **Status: under development.** The repository was generated with
-> `@tabularis/create-plugin` and the RPC handlers are still stubs. The
-> `.tabularium` manifest already declares the capabilities of the finished
-> driver. Implementation is planned in [`docs/architecture`](./docs/architecture/README.md).
+> **Status: alpha (`0.1.0-alpha.1`).** Connecting, browsing the schema, running
+> queries and editing rows work. DDL generation, `EXPLAIN` and a few metadata
+> views are not implemented yet; see [Known limitations](#known-limitations).
+> The `.tabularium` manifest declares the capabilities of the finished driver,
+> so a few features it advertises still return an error until they land.
+> Implementation follows [`docs/architecture`](./docs/architecture/README.md).
 >
 > **Requires Tabularis v0.29.0 or later** (column comments and connection
-> field overrides in the manifest).
+> field overrides in the manifest). Tested against CockroachDB v24.3 (the
+> oldest supported LTS line) and the latest release.
 
 ## Table of Contents
 
-- [Planned Features](#planned-features)
+- [Features](#features)
+- [Known limitations](#known-limitations)
 - [Connection Configuration](#connection-configuration)
 - [Supported CockroachDB Data Types](#supported-cockroachdb-data-types)
 - [Installation](#installation)
@@ -53,29 +57,75 @@ gets wrong. This plugin handles those differences natively.
 - [Maintainers](#maintainers)
 - [License](#license)
 
-## Planned Features
+## Features
 
-- **CockroachDB detection and version gating**: reads `version()` /
-  `crdb_internal.node_build_info` and enables features per server release.
-- **Schema browsing**: databases, schemas, tables, views, materialized views,
-  sequences, user-defined functions, indexes (including hash-sharded,
-  partial, inverted, and vector indexes), foreign keys, and comments. Hidden
-  columns such as `rowid` and `crdb_region` are excluded by default.
-- **Query execution**: pooled connections, result pagination, query
-  cancellation, and automatic retry of implicit transactions on serialization
-  failures (`SQLSTATE 40001`).
+Available in this release:
+
+- **Connection and TLS**: pooled connections, `disable`, `prefer`, `require`,
+  `verify-ca` and `verify-full` modes with a custom CA and client certificates
+  (PKCS#8, PKCS#1 and SEC1 keys, as `cockroach cert create-client` writes),
+  `cockroachdb://`, `cockroach://`, `postgresql://` and `postgres://` connection
+  strings, and `options=--cluster=...` passed through for CockroachDB Cloud.
+  The plugin reads the real server version from `version()` and refuses to
+  connect to a server that is not CockroachDB.
+- **Schema browsing**: databases, schemas, tables (with comments and row
+  estimates), views, columns (canonical types, comments, primary keys), indexes
+  (key, `STORING`, expression and hash-sharded columns), foreign keys including
+  composite ones, and the `SHOW CREATE TABLE` DDL. Hidden columns such as
+  `rowid` and `crdb_region` are excluded by default.
+- **Query execution**: pagination that understands comments, strings and
+  `LIMIT`/`OFFSET`, script batches, transactions that span several runs of an
+  editor tab, query cancellation, and automatic retry of implicit
+  transactions on serialization failures (`SQLSTATE 40001`). Errors carry the
+  SQLSTATE, `DETAIL` and `HINT`. `INT8` values beyond JavaScript's safe range
+  arrive as strings, so `unique_rowid()` keys are never rounded.
+- **Row editing**: insert, update and delete from the data grid with
+  type-aware binding for `STRING`, `INT8`, `DECIMAL`, `UUID`, `JSONB`,
+  `BYTES`, arrays, `INET`, enums and more. Composite keys, `NULL` keys, tables
+  without a primary key (through the hidden `rowid`) and connections that
+  default to read-only all work. An edit whose key would change more than one
+  row is refused, and editing a row that no longer exists is reported as a
+  conflict, not as a success.
+- **BLOBs**: preview a `BYTES` cell, save it to a file, and upload a file into
+  it (up to the host's `maxBlobSize`).
+
+Planned (see [Known limitations](#known-limitations)):
+
 - **EXPLAIN**: `EXPLAIN` and `EXPLAIN ANALYZE` rendered as visual plans,
   including distributed execution details.
-- **Row editing**: type-aware binding for `STRING`, `INT8`, `DECIMAL`, `UUID`,
-  `JSONB`, `BYTES`, arrays, `INET`, enums, and spatial types.
 - **DDL generation**: CockroachDB-native `CREATE TABLE`, `ALTER PRIMARY KEY`,
   `table@index` index operations, `STORING`, hash-sharded and inverted
-  indexes, and `unique_rowid()` / `gen_random_uuid()` keys.
-- **Multi-region awareness**: table localities (`REGIONAL BY ROW`, `GLOBAL`),
-  database regions, and survival goals in metadata.
-- **TLS**: `disable`, `require`, `verify-ca`, and `verify-full` modes with a
-  custom CA and client certificates, which CockroachDB uses for certificate
-  authentication.
+  indexes, and `unique_rowid()` / `gen_random_uuid()` keys, plus view
+  creation, alteration and removal.
+- **More metadata**: materialized views, sequences, user-defined functions,
+  multi-region awareness (table localities, database regions, survival goals)
+  and the schema snapshot behind the ER diagram.
+
+## Known limitations
+
+This is an alpha. These gaps are known and tracked in
+[#16](https://github.com/TabularisDB/tabularis-cockroachdb-plugin/issues/16):
+
+- **`EXPLAIN` is not implemented.** The explain button returns a
+  "Method not found" error.
+- **DDL helpers are not implemented**: `get_create_table_sql`,
+  `get_add_column_sql`, `get_alter_column_sql`, `get_create_index_sql`,
+  `get_create_foreign_key_sql`, `drop_index`, `drop_foreign_key` and the view
+  mutations (`create_view`, `alter_view`, `drop_view`). The manifest already
+  advertises `manage_tables`, `alter_column` and `create_foreign_keys`, so the
+  UI offers them and they fail with "Method not found". Running DDL as SQL in
+  the query editor works, and `SHOW CREATE TABLE` browsing works.
+- **Not yet listed in the sidebar or the ER diagram**: materialized views,
+  sequences, routines, triggers, multi-region metadata and the schema
+  snapshot.
+- **Untested here**: `options=--cluster=...` against a real CockroachDB Cloud
+  cluster, query cancellation behind a load balancer (the pgwire cancel
+  request may reach another node), and a real `40001` retry of an implicit
+  statement, which could not be provoked on the tested releases. The retry
+  rules themselves have unit tests.
+- **Pagination of an unusual `LIMIT` form** (`LIMIT ALL`, `FETCH FIRST`) wraps
+  the statement in a subquery. CockroachDB orders such a subquery in practice,
+  but SQL does not guarantee it.
 
 ## Connection Configuration
 
@@ -109,7 +159,7 @@ the connection type.
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `poolMaxSize` | `10` | Maximum pooled connections per connection profile. |
-| `retryMaxAttempts` | `3` | Automatic retries of implicit transactions on `40001`. `0` disables retries. |
+| `retryMaxAttempts` | `3` | Automatic retries, on `40001`, of statements run outside a transaction and of row edits. `0` disables retries. |
 | `applicationName` | `tabularis` | `application_name` reported to the cluster. |
 
 ## Supported CockroachDB Data Types
@@ -136,7 +186,10 @@ for **CockroachDB**, and click **Install**.
 ### Manual installation
 
 1. Download the archive for your platform from
-   [Releases](https://github.com/TabularisDB/tabularis-cockroachdb-plugin/releases).
+   [Releases](https://github.com/TabularisDB/tabularis-cockroachdb-plugin/releases):
+   `cockroachdb-plugin-linux-x64.zip`, `-linux-arm64.zip`, `-darwin-x64.zip`,
+   `-darwin-arm64.zip` or `-win-x64.zip`. Pre-releases such as `0.1.0-alpha.1`
+   are marked as such on that page.
 2. Extract it into the Tabularis plugins folder:
 
 | OS | Path |
@@ -200,8 +253,19 @@ Manual JSON-RPC call:
 echo '{"jsonrpc":"2.0","method":"initialize","id":1}' | ./target/debug/cockroachdb-plugin
 ```
 
-Live-cluster tests go in `tests/live_db.rs`. CI runs them against the oldest
-supported LTS line and the latest CockroachDB image once that file exists.
+Tests that need a server run against a real CockroachDB node: the integration
+tests in `tests/live_db.rs`, and the decoding and binding tests inside the
+crate. Point them at the local node from above:
+
+```bash
+COCKROACH_HOST=127.0.0.1 cargo test
+```
+
+Without `COCKROACH_HOST` those tests skip, and Rust reports a skip as a pass.
+CI therefore also sets `REQUIRE_LIVE_DB=1`, which turns a missing host into a
+failure, and runs everything against the oldest supported LTS line and the
+latest CockroachDB image. See
+[`docs/architecture/09-testing.md`](./docs/architecture/09-testing.md).
 
 ### Contributing: PR Titles & Versioning
 
@@ -213,7 +277,8 @@ PR description for breaking changes that don't fit in the title.
 Every PR also needs exactly one `prerelease:alpha`, `prerelease:beta`,
 `prerelease:rc`, or `prerelease:stable` label, so CI knows which release
 channel to target when it suggests the next version. Until the driver is
-feature-complete, use `prerelease:alpha`.
+feature-complete (DDL generation and `EXPLAIN` are still open), use
+`prerelease:alpha`.
 
 | PR title type | Version impact |
 | --- | --- |
@@ -222,9 +287,16 @@ feature-complete, use `prerelease:alpha`.
 | `docs`, `style`, `chore`, `test`, `ci`, `build` | none |
 | any type with `!` or a `BREAKING CHANGE:` footer | major |
 
-Releases are cut by pushing a `vX.Y.Z` tag. The tag must equal the
+Releases are cut by pushing a `vX.Y.Z` tag (a pre-release such as
+`v0.1.0-alpha.1` is flagged as one automatically). The tag must equal the
 `.tabularium` version, and `CHANGELOG.md` must contain a `## [X.Y.Z]`
-section, which becomes the release notes.
+section, which becomes the release notes. To cut a release:
+
+1. In one PR, set the version in `.tabularium` and `Cargo.toml` (then run
+   `cargo build` so `Cargo.lock` follows) and move the `[Unreleased]` notes
+   into a new `## [X.Y.Z]` section of `CHANGELOG.md`.
+2. After it merges, tag that commit and push the tag:
+   `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 ## Architecture Documents
 

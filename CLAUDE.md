@@ -2,11 +2,15 @@
 
 ## Status
 
-Scaffolded with `@tabularis/create-plugin`; handlers are stubs. The
-`.tabularium` manifest already declares the target capabilities, so features
-whose handlers still return `-32601` show errors in the UI until they are
-implemented. What to build, and in which order, is specified in
-`docs/architecture/` (start at `docs/architecture/README.md`).
+Alpha (`0.1.0-alpha.1`). Connection and TLS, schema browsing, result decoding,
+query execution (batches, sessions, cancellation, retries) and row editing
+with BLOBs are implemented and tested. Still stubs that return `-32601`: the
+DDL helpers and view mutations, `explain_query`, and the phase 7 metadata
+(materialized views, sequences, routines, schema snapshot). The `.tabularium`
+manifest declares the finished driver's capabilities, so those features show
+errors in the UI until they land. Tracked in issue #16. What to build, and in
+which order, is specified in `docs/architecture/` (start at
+`docs/architecture/README.md`).
 
 ## Build & Test
 
@@ -18,6 +22,11 @@ cargo clippy --all-targets -- -D warnings  # Lint
 cargo fmt --all          # Format
 just dev-install         # Build and install into the local Tabularis plugins dir
 ```
+
+Tests that need a server skip without `COCKROACH_HOST` (Rust reports a skip as
+a pass). CI sets `REQUIRE_LIVE_DB=1` to make a missing host a failure; run the
+same way locally with
+`COCKROACH_HOST=127.0.0.1 REQUIRE_LIVE_DB=1 cargo test`.
 
 Local cluster for manual and live tests:
 
