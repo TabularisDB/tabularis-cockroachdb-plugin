@@ -1,11 +1,37 @@
 //! Live tests: drive the plugin binary over JSON-RPC against a real node.
-//! Set `COCKROACH_HOST` (and optionally `COCKROACH_PORT`) to enable; the node
-//! is assumed to be started with `--insecure`.
+//!
+//! Set `COCKROACH_HOST` (and `COCKROACH_PORT` if not 26257) to run them; the
+//! node is assumed to be started with `--insecure`. Without a host they skip,
+//! and a skipped test is reported as passed, so CI sets `REQUIRE_LIVE_DB=1`,
+//! which makes a missing host a failure instead of a silent skip.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
+
+/// The node to test against, or `None` to skip. Panics when the host is
+/// missing and `REQUIRE_LIVE_DB` is set. (Same rule as `src/testenv.rs`; an
+/// integration test cannot import from the binary crate.)
+fn live_node() -> Option<(String, u16)> {
+    let host = std::env::var("COCKROACH_HOST")
+        .ok()
+        .filter(|h| !h.is_empty());
+    let required = std::env::var("REQUIRE_LIVE_DB").is_ok_and(|v| !v.is_empty() && v != "0");
+    match host {
+        Some(host) => {
+            let port = std::env::var("COCKROACH_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(26257);
+            Some((host, port))
+        }
+        None if required => {
+            panic!("REQUIRE_LIVE_DB is set but COCKROACH_HOST is not: refusing to skip a live test")
+        }
+        None => None,
+    }
+}
 
 fn rpc(method: &str, params: Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cockroachdb-plugin"))
@@ -24,11 +50,7 @@ fn rpc(method: &str, params: Value) -> Value {
 }
 
 fn conn(ssl_mode: &str) -> Option<Value> {
-    let host = std::env::var("COCKROACH_HOST").ok()?;
-    let port: u16 = std::env::var("COCKROACH_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(26257);
+    let (host, port) = live_node()?;
     Some(
         json!({"params": {"driver": "cockroachdb", "host": host, "port": port,
         "username": "root", "ssl_mode": ssl_mode}}),
@@ -78,17 +100,12 @@ const SCHEMA: &str = "live_introspection";
 fn seed() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let host = std::env::var("COCKROACH_HOST").unwrap();
+        let (host, port) = live_node().expect("live node");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (client, conn) = tokio_postgres::Config::new()
                 .host(&host)
-                .port(
-                    std::env::var("COCKROACH_PORT")
-                        .ok()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(26257),
-                )
+                .port(port)
                 .user("root")
                 .dbname("defaultdb")
                 .connect(tokio_postgres::NoTls)
@@ -340,7 +357,7 @@ impl Plugin {
     }
 
     fn spawn() -> Option<Self> {
-        std::env::var("COCKROACH_HOST").ok()?;
+        live_node()?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_cockroachdb-plugin"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

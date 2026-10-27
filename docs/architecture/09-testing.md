@@ -24,19 +24,28 @@ Each pure function sits next to a sibling `_tests.rs` file and runs in
 ## Live-cluster tests
 
 `tests/live_db.rs` drives the compiled binary over stdio, the way the host
-does, against a real node. CI runs it in the `live-db-integration` job once
-the file exists:
+does, against a real node. The decoding and binding tests inside the crate
+(`src/extract_tests.rs`, `src/binding_tests.rs`) also need the node. CI runs
+every test, with the node configured through these variables:
 
-| Variable | CI value |
-| --- | --- |
-| `COCKROACHDB_PLUGIN_BIN` | `target/debug/cockroachdb-plugin` |
-| `CRDB_HOST` / `CRDB_PORT` | `127.0.0.1` / `26257` |
-| `CRDB_USER` | `root` |
-| `CRDB_DATABASE` | `testdb` |
-| `CRDB_SSLMODE` | `disable` (the CI node runs `--insecure`) |
+| Variable | Meaning | CI value |
+| --- | --- | --- |
+| `COCKROACH_HOST` | Node to test against. Without it, live tests skip. | `127.0.0.1` |
+| `COCKROACH_PORT` | Node port. | `26257` (the default) |
+| `REQUIRE_LIVE_DB` | Turns a missing `COCKROACH_HOST` into a failure. | `1` |
 
-The tests create their own schema per run (`test_<random>`) and drop it at
-the end. Cover at least:
+The nodes run `--insecure`, as `root` on `defaultdb`.
+
+**A skipped test is reported as passed.** Rust has no "skipped" result, so a
+live test with no node returns early and counts as a success. `REQUIRE_LIVE_DB`
+is the guard: with it set, a missing host fails the test, and an unreachable
+configured node fails on its first connection. CI sets it. Locally you can
+leave it unset to run the pure tests without a node. The variable names are
+read in two places only, `tests/live_db.rs` and `src/testenv.rs`; keep them in
+step with `.github/workflows/ci.yml`.
+
+The tests create their own schema and tables and drop them when they finish.
+Cover at least:
 
 - `test_connection` returns the version string; a wrong port fails cleanly.
 - Two tables in one schema that both have an index called `idx_name`;
