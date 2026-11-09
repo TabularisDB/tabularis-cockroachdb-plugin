@@ -85,8 +85,10 @@ async fn dispatch(method: &str, id: Value, params: Value) -> Value {
 
         "get_table_ddl" => handlers::metadata::get_table_ddl(id, &params).await,
 
-        // View mutation — not implemented by default.
-        "create_view" | "alter_view" | "drop_view" => not_implemented(id, method),
+        // View mutation.
+        "create_view" => handlers::ddl::create_view(id, &params).await,
+        "alter_view" => handlers::ddl::alter_view(id, &params).await,
+        "drop_view" => handlers::ddl::drop_view(id, &params).await,
 
         // Query execution — critical but needs a real driver.
         "execute_query" => handlers::query::execute_query(id, &params).await,
@@ -105,13 +107,15 @@ async fn dispatch(method: &str, id: Value, params: Value) -> Value {
         "fetch_blob_as_data_url" => handlers::blob::fetch_blob_as_data_url(id, &params).await,
 
         // DDL.
-        "get_create_table_sql" => handlers::ddl::get_create_table_sql(id, &params),
-        "get_add_column_sql" => handlers::ddl::get_add_column_sql(id, &params),
-        "get_alter_column_sql" => handlers::ddl::get_alter_column_sql(id, &params),
-        "get_create_index_sql" => handlers::ddl::get_create_index_sql(id, &params),
-        "get_create_foreign_key_sql" => handlers::ddl::get_create_foreign_key_sql(id, &params),
-        "drop_index" => handlers::ddl::drop_index(id, &params),
-        "drop_foreign_key" => handlers::ddl::drop_foreign_key(id, &params),
+        "get_create_table_sql" => handlers::ddl::get_create_table_sql(id, &params).await,
+        "get_add_column_sql" => handlers::ddl::get_add_column_sql(id, &params).await,
+        "get_alter_column_sql" => handlers::ddl::get_alter_column_sql(id, &params).await,
+        "get_create_index_sql" => handlers::ddl::get_create_index_sql(id, &params).await,
+        "get_create_foreign_key_sql" => {
+            handlers::ddl::get_create_foreign_key_sql(id, &params).await
+        }
+        "drop_index" => handlers::ddl::drop_index(id, &params).await,
+        "drop_foreign_key" => handlers::ddl::drop_foreign_key(id, &params).await,
 
         other => not_implemented(id, other),
     }

@@ -33,8 +33,9 @@ wire protocol, but its catalog, type system, DDL, transaction model, and
 gets wrong. This plugin handles those differences natively.
 
 > **Status: alpha (`0.1.0-alpha.1`).** Connecting, browsing the schema, running
-> queries and editing rows work. DDL generation, `EXPLAIN` and a few metadata
-> views are not implemented yet; see [Known limitations](#known-limitations).
+> queries, editing rows and managing tables, columns, indexes, foreign keys and
+> views work. `EXPLAIN` and a few metadata views are not implemented yet; see
+> [Known limitations](#known-limitations).
 > The `.tabularium` manifest declares the capabilities of the finished driver,
 > so a few features it advertises still return an error until they land.
 > Implementation follows [`docs/architecture`](./docs/architecture/README.md).
@@ -88,15 +89,20 @@ Available in this release:
   conflict, not as a success.
 - **BLOBs**: preview a `BYTES` cell, save it to a file, and upload a file into
   it (up to the host's `maxBlobSize`).
+- **Schema management**: create tables (primary key named `<table>_pkey`,
+  composite keys, `SERIAL` columns, column comments), add columns (including a
+  primary key column, which extends the table's key), alter columns (rename,
+  type, default, nullability, comment), create and drop indexes
+  (`table@index`, so a name shared by two tables is never ambiguous), create and
+  drop foreign keys, and create, replace and drop views. The host previews the
+  generated SQL before it runs. Types, defaults and view queries are checked so
+  they cannot end the statement or start a comment, names are always quoted, and
+  drops never cascade.
 
 Planned (see [Known limitations](#known-limitations)):
 
 - **EXPLAIN**: `EXPLAIN` and `EXPLAIN ANALYZE` rendered as visual plans,
   including distributed execution details.
-- **DDL generation**: CockroachDB-native `CREATE TABLE`, `ALTER PRIMARY KEY`,
-  `table@index` index operations, `STORING`, hash-sharded and inverted
-  indexes, and `unique_rowid()` / `gen_random_uuid()` keys, plus view
-  creation, alteration and removal.
 - **More metadata**: materialized views, sequences, user-defined functions,
   multi-region awareness (table localities, database regions, survival goals)
   and the schema snapshot behind the ER diagram.
@@ -108,13 +114,21 @@ This is an alpha. These gaps are known and tracked in
 
 - **`EXPLAIN` is not implemented.** The explain button returns a
   "Method not found" error.
-- **DDL helpers are not implemented**: `get_create_table_sql`,
-  `get_add_column_sql`, `get_alter_column_sql`, `get_create_index_sql`,
-  `get_create_foreign_key_sql`, `drop_index`, `drop_foreign_key` and the view
-  mutations (`create_view`, `alter_view`, `drop_view`). The manifest already
-  advertises `manage_tables`, `alter_column` and `create_foreign_keys`, so the
-  UI offers them and they fail with "Method not found". Running DDL as SQL in
-  the query editor works, and `SHOW CREATE TABLE` browsing works.
+- **Schema management follows what the host's dialogs send.** CockroachDB
+  options they do not offer are not generated: `STORING`, hash-sharded,
+  inverted and partial indexes, `NOT VALID` foreign keys, comments on tables and
+  schemas, and multi-region `LOCALITY`. Run those as SQL in the editor.
+- **A type change that converts data needs a session setting on v24.3.** The
+  generated `ALTER COLUMN .. TYPE .. USING` works as it is on v26.3. On v24.3 the
+  server refuses it unless `SET enable_experimental_alter_column_type_general =
+  true` runs in the same session, so run both together as one script. The host
+  runs each generated statement separately, which is why the setting is explained
+  in a comment and not emitted.
+- **Replacing a view whose columns change** (not just appending one) drops and
+  recreates it, and the view is invisible for about 70 ms meanwhile. A view that
+  other views depend on cannot be replaced, and an index that backs a referenced
+  `UNIQUE` constraint is not dropped: the error says so, and the exact
+  `... CASCADE` statement is given for the SQL editor.
 - **Not yet listed in the sidebar or the ER diagram**: materialized views,
   sequences, routines, triggers, multi-region metadata and the schema
   snapshot.

@@ -52,12 +52,13 @@ are not done yet shows errors in the UI. That is expected during the alpha.
 | 2. Browse | Databases, schemas, tables, columns, PKs, FKs, indexes, views, DDL text | 02, 03 | Done |
 | 3. Query | `execute_query`, batches, sessions, cancellation, retries | 05, 03 | Done |
 | 4. Edit | `insert_record`, `update_record`, `delete_record`, BLOBs | 07, 03 | Done |
-| 5. DDL | Create/alter table, column, index, FK, comments, drops | 04 | To do |
+| 5. DDL | Create/alter table, column, index, FK, comments, drops | 04 | Done |
 | 6. Plans | `explain_query` with the text-tree parser | 06 | To do |
 | 7. Extras | Materialized views, sequences, routines, multi-region metadata, schema snapshot | 02, 04 | To do |
 | 8. Release | Live tests on the CI matrix, screenshots, `1.0.0` | 09 | In progress (`0.1.0-alpha.1`) |
 
-Phases 5 and 6 are tracked in issue #16.
+Phase 5 covers the schema changes the host's dialogs request; `04-ddl.md` lists
+what is not generated. Phase 6 is tracked in issue #16.
 
 ## Starting point
 

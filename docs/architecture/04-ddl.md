@@ -4,6 +4,75 @@ The DDL generators return SQL text. The host shows it to the user and runs
 it through `execute_query`. All of them are pure functions of their input;
 unit-test them without a server.
 
+## What the host sends, and what runs where
+
+Read from the host's code and checked against the live plugin; this differs from
+the plugin guide in a few places.
+
+| Method | Request fields | Reply |
+| --- | --- | --- |
+| `get_create_table_sql` | `table_name`, `columns[]`, `schema` | array of statements |
+| `get_add_column_sql` | `table`, `column`, `schema` | array of statements |
+| `get_alter_column_sql` | `table`, `old_column`, `new_column`, `schema` | array of statements |
+| `get_create_index_sql` | `table`, `index_name`, `columns[]`, `is_unique`, `schema` | array of one statement |
+| `get_create_foreign_key_sql` | `table`, `fk_name`, `column`, `ref_table`, `ref_column`, `on_delete`, `on_update`, `schema` | array of one statement |
+| `drop_index` | `table`, `index_name`, `schema` | `null` (the plugin runs it) |
+| `drop_foreign_key` | `table`, `fk_name`, `schema` | `null` (the plugin runs it) |
+| `create_view` / `alter_view` | `view_name`, `definition`, `schema` | `null` (the plugin runs it) |
+| `drop_view` | `view_name`, `schema` | `null` (the plugin runs it) |
+
+A column is `{name, data_type, is_nullable, is_pk, is_auto_increment,
+default_value, comment}`. The generators are previews: the host shows the
+statements and then runs **each one as its own `execute_query` call, on
+whichever connection is free and without a session**. Three consequences:
+
+- A `SET` cannot be returned as a statement of its own. It would not reach the
+  next statement (and the plugin resets session state after every run).
+- Every statement must be valid on its own, so a rename comes before the
+  changes that use the new name.
+- Free-form text from the dialogs (a type, a default expression, a view's
+  `SELECT`) is checked before it is spliced into SQL: no `;`, no comment that
+  could swallow what follows, no quote or parenthesis left open. Names are always
+  quoted, comment text is a quoted literal, and foreign key actions must be one
+  of the five SQL actions.
+
+## Verified on v24.3 and v26.3
+
+| Behavior | Result |
+| --- | --- |
+| `ALTER COLUMN TYPE` that keeps the data shape (`VARCHAR(n)` wider, `DECIMAL` precision, `TIMESTAMP`→`TIMESTAMPTZ`, `JSON`→`JSONB`) | Runs in place on both |
+| `ALTER COLUMN TYPE` that converts data (`INT8`↔`STRING`, `STRING`→`UUID`) | v26.3 runs it. **v24.3 refuses** with `XCEXF` unless `SET enable_experimental_alter_column_type_general = true` is set in the same session. |
+| `STRING`→`INT8` without `USING` | Refused on both (`42804`), so a converting change always gets `USING col::type` |
+| `ADD COLUMN .. PRIMARY KEY` on a table that has a key | Refused (`42611`). The column is added, then `ALTER PRIMARY KEY USING COLUMNS (<old key>, <new>)` runs. |
+| `ADD COLUMN SERIAL`, `SERIAL4`, `SMALLSERIAL` | Work; the width is kept |
+| `CREATE OR REPLACE VIEW` appending a column | Works |
+| `CREATE OR REPLACE VIEW` changing or dropping a column | Refused with `42P16` on both |
+| `DROP VIEW` + `CREATE VIEW` in one transaction | Works; if the `CREATE` fails the old view survives |
+| `DROP INDEX schema.index` when two tables share the name | Ambiguous (`42P08`); `schema.table@index` is required |
+| `DROP INDEX` for the index behind a referenced `UNIQUE` constraint | Refused (`2BP01`); `CASCADE` also drops the foreign keys |
+
+## What the plugin does about it
+
+- **Type changes.** Compatible changes (same family: integers, floats and
+  decimals, strings, timestamps, times, JSON, bit strings) are one `ALTER COLUMN
+  TYPE`. Anything else gets `USING col::type` and a leading SQL comment saying
+  that v24.3 needs the session setting, to be run with the statement as one
+  script. The setting is not emitted as a statement because of the execution
+  model above; the server's own error names it too.
+- **Primary key on an added column.** The table's current key is read from
+  `information_schema` (hidden `rowid` excluded), so the new column extends it.
+- **`alter_view`.** Tries `CREATE OR REPLACE VIEW`; on `42P16` it drops and
+  creates the view in one transaction, so a failure in between restores the old
+  view. The view is still invisible for a short moment (about 70 ms on v26.3.3)
+  while the change is applied; a transaction does not hide that. A view that
+  other views depend on cannot be dropped, and the error is returned as it is.
+- **`drop_index`** never cascades. The `2BP01` error is returned with the exact
+  `... CASCADE` statement to run in the SQL editor if that is really wanted.
+- **Not offered by the host's dialogs, so not generated:** `STORING`,
+  hash-sharded, inverted, vector and partial indexes, `NOT VALID` foreign keys,
+  comments on tables and schemas, renames, and `LOCALITY` clauses. The host runs
+  its own generic SQL for `DROP TABLE` and renames.
+
 ## How schema changes behave
 
 - **Online and asynchronous.** Most schema changes (adding a column with a
@@ -76,9 +145,9 @@ ALTER TABLE <schema>.<table> ALTER COLUMN <column> TYPE <type> [USING <expr>]
   `INT4` to `INT8`) run in place. Changes that rewrite data need a
   backfill. On older releases they also need
   `SET enable_experimental_alter_column_type_general = true` in the session
-  and cannot run inside an explicit transaction. Verify the gate per release
-  on the CI matrix, and emit the `SET` before the `ALTER` only when the
-  connected version needs it.
+  and cannot run inside an explicit transaction. Verified: v24.3 needs it for
+  data-converting changes and v26.3 does not. The plugin does not emit the
+  `SET` (see "What the host sends"); it explains it in a comment instead.
 - A column that is part of the primary key or of an index cannot change type
   in place. Report the server error; do not try to rebuild the table.
 

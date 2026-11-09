@@ -9,6 +9,24 @@ release workflow publishes that section as the GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Schema management** (phase 5): `get_create_table_sql`, `get_add_column_sql`,
+  `get_alter_column_sql`, `get_create_index_sql`, `get_create_foreign_key_sql`,
+  `drop_index`, `drop_foreign_key`, `create_view`, `alter_view` and `drop_view`.
+  Primary keys are named `<table>_pkey`; `SERIAL` keeps its width; a new primary
+  key column extends the table's key through `ALTER PRIMARY KEY`; converting a
+  column's type adds `USING` and a note about the v24.3 session setting; indexes
+  are dropped as `schema.table@index`; a view whose columns change is replaced by
+  dropping and creating it in one transaction. Types, defaults and view queries
+  are validated before they are used in SQL, foreign key actions are limited to
+  the five SQL actions, and drops never cascade.
+
+### Changed
+
+- `docs/architecture/04-ddl.md` now records the host's real request and reply
+  shapes and what was verified on v24.3 and v26.3.
+
 ## [0.1.0-alpha.1] - 2026-10-27
 
 First public alpha. Connecting, browsing, querying and row editing work;

@@ -1752,3 +1752,664 @@ fn base64_of(data: &[u8]) -> String {
     }
     out
 }
+
+// ---- Phase 5: DDL ----------------------------------------------------------
+//
+// The host asks for statements and then runs each one as its own `execute_query`
+// call, with no session, so these tests do exactly that.
+
+fn run_statements(p: &mut Plugin, reply: &Value) {
+    let list = reply["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a statement list: {reply}"));
+    assert!(!list.is_empty(), "{reply}");
+    for sql in list {
+        let r = p.query(sql.as_str().unwrap());
+        assert!(r.get("error").is_none(), "{sql}: {r}");
+    }
+}
+
+fn column_of(p: &mut Plugin, table: &str, name: &str) -> Value {
+    let cols = p.call("get_columns", json!({"table": table}));
+    cols["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{cols}"))
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no column {name} in {table}: {cols}"))
+        .clone()
+}
+
+fn index_names(p: &mut Plugin, table: &str) -> Vec<String> {
+    let r = p.call("get_indexes", json!({"table": table}));
+    let mut names: Vec<String> = r["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap().to_string())
+        .collect();
+    names.dedup();
+    names
+}
+
+fn pk_columns(p: &mut Plugin, table: &str) -> Vec<String> {
+    rows_of(
+        p,
+        &format!(
+            "SELECT kcu.column_name FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name \
+              AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = '{table}' AND kcu.column_name <> 'rowid' \
+             ORDER BY kcu.ordinal_position"
+        ),
+    )
+    .iter()
+    .map(|r| r[0].as_str().unwrap().to_string())
+    .collect()
+}
+
+fn drop_tables(p: &mut Plugin, names: &[&str]) {
+    for n in names {
+        p.query(&format!("DROP TABLE IF EXISTS {n} CASCADE"));
+    }
+}
+
+fn error_text(r: &Value) -> String {
+    r["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn major_version(p: &mut Plugin) -> u32 {
+    let v = p.call("test_connection", json!({}));
+    let text = v["result"]["version"].as_str().unwrap().to_string();
+    let after = text.split(" v").nth(1).unwrap();
+    after.split('.').next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_created_table_has_what_was_asked_for() {
+    let Some(mut p) = Plugin::start() else { return };
+    drop_tables(&mut p, &["live_d1"]);
+    let reply = p.call(
+        "get_create_table_sql",
+        json!({"table_name": "live_d1", "columns": [
+            {"name": "id", "data_type": "UUID", "is_nullable": false, "is_pk": true, "is_auto_increment": false, "default_value": "gen_random_uuid()"},
+            {"name": "email", "data_type": "VARCHAR(255)", "is_nullable": false, "is_pk": false, "is_auto_increment": false, "default_value": null, "comment": "login address"},
+            {"name": "created_at", "data_type": "TIMESTAMPTZ", "is_nullable": false, "is_pk": false, "is_auto_increment": false, "default_value": "now()"},
+            {"name": "score", "data_type": "DECIMAL(10,2)", "is_nullable": true, "is_pk": false, "is_auto_increment": false, "default_value": null}]}),
+    );
+    run_statements(&mut p, &reply);
+
+    let id = column_of(&mut p, "live_d1", "id");
+    assert_eq!(
+        (
+            id["data_type"].as_str(),
+            id["is_pk"].as_bool(),
+            id["is_nullable"].as_bool()
+        ),
+        (Some("UUID"), Some(true), Some(false))
+    );
+    assert_eq!(id["default_value"], "gen_random_uuid()");
+    let email = column_of(&mut p, "live_d1", "email");
+    assert_eq!(
+        (
+            email["data_type"].as_str(),
+            email["character_maximum_length"].as_i64()
+        ),
+        (Some("VARCHAR"), Some(255))
+    );
+    assert_eq!(email["comment"], "login address");
+    let score = column_of(&mut p, "live_d1", "score");
+    assert_eq!(
+        (
+            score["numeric_precision"].as_i64(),
+            score["numeric_scale"].as_i64(),
+            score["is_nullable"].as_bool()
+        ),
+        (Some(10), Some(2), Some(true))
+    );
+    assert_eq!(
+        column_of(&mut p, "live_d1", "created_at")["default_value"],
+        "now()"
+    );
+    // The primary key constraint is named after the table, as CockroachDB names it.
+    assert_eq!(index_names(&mut p, "live_d1"), ["live_d1_pkey"]);
+    // The defaults work: only the required columns are given.
+    p.call(
+        "insert_record",
+        json!({"table": "live_d1", "data": {"email": "a@x.com"}}),
+    );
+    let row = &rows_of(&mut p, "SELECT id, created_at FROM live_d1")[0];
+    assert!(row[0].as_str().unwrap().len() == 36 && row[1].is_string());
+    drop_tables(&mut p, &["live_d1"]);
+}
+
+#[test]
+fn serial_and_composite_keys_and_the_no_key_warning() {
+    let Some(mut p) = Plugin::start() else { return };
+    drop_tables(&mut p, &["live_d2", "live_d2b", "live_d2c"]);
+    let serial = p.call("get_create_table_sql", json!({"table_name": "live_d2", "columns": [
+        {"name": "n", "data_type": "INT8", "is_nullable": false, "is_pk": true, "is_auto_increment": true},
+        {"name": "small", "data_type": "INT4", "is_nullable": true, "is_pk": false, "is_auto_increment": false}]}));
+    run_statements(&mut p, &serial);
+    assert_eq!(
+        column_of(&mut p, "live_d2", "n")["default_value"],
+        "unique_rowid()"
+    );
+    assert_eq!(column_of(&mut p, "live_d2", "n")["is_auto_increment"], true);
+    p.call(
+        "insert_record",
+        json!({"table": "live_d2", "data": {"small": 1}}),
+    );
+    assert_eq!(count(&mut p, "live_d2"), 1);
+
+    let composite = p.call(
+        "get_create_table_sql",
+        json!({"table_name": "live_d2b", "columns": [
+        {"name": "a", "data_type": "INT8", "is_nullable": false, "is_pk": true},
+        {"name": "b", "data_type": "STRING", "is_nullable": false, "is_pk": true},
+        {"name": "v", "data_type": "STRING", "is_nullable": true, "is_pk": false}]}),
+    );
+    run_statements(&mut p, &composite);
+    assert_eq!(pk_columns(&mut p, "live_d2b"), ["a", "b"]);
+
+    // No primary key: still generated, with a warning; CockroachDB adds the hidden rowid.
+    let none = p.call("get_create_table_sql", json!({"table_name": "live_d2c", "columns": [{"name": "a", "data_type": "INT8", "is_nullable": true, "is_pk": false}]}));
+    assert!(
+        none["result"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("-- Warning: no primary key"),
+        "{none}"
+    );
+    run_statements(&mut p, &none);
+    assert_eq!(rows_of(&mut p, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'live_d2c' AND column_name = 'rowid'")[0][0], 1);
+    drop_tables(&mut p, &["live_d2", "live_d2b", "live_d2c"]);
+}
+
+#[test]
+fn added_columns_arrive_with_their_type_default_and_comment() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_d3", "id INT8 PRIMARY KEY");
+    p.query("INSERT INTO live_d3 VALUES (1), (2)");
+    let reply = p.call("get_add_column_sql", json!({"table": "live_d3", "column": {
+        "name": "status", "data_type": "STRING", "is_nullable": false, "is_pk": false, "default_value": "'new'", "comment": "workflow state"}}));
+    run_statements(&mut p, &reply);
+    let c = column_of(&mut p, "live_d3", "status");
+    assert_eq!(
+        (c["is_nullable"].as_bool(), c["comment"].as_str()),
+        (Some(false), Some("workflow state"))
+    );
+    assert_eq!(
+        rows_of(&mut p, "SELECT DISTINCT status FROM live_d3")[0][0],
+        "new",
+        "existing rows take the default"
+    );
+
+    // An auto-increment integer becomes a serial.
+    let serial = p.call("get_add_column_sql", json!({"table": "live_d3", "column": {"name": "seq", "data_type": "INT8", "is_nullable": false, "is_auto_increment": true}}));
+    run_statements(&mut p, &serial);
+    assert_eq!(
+        column_of(&mut p, "live_d3", "seq")["default_value"],
+        "unique_rowid()"
+    );
+    p.query("DROP TABLE live_d3");
+}
+
+#[test]
+fn a_new_primary_key_column_extends_the_key_or_replaces_the_hidden_rowid() {
+    let Some(mut p) = Plugin::start() else { return };
+    // A table that already has a key: the new column joins it (composite).
+    fresh_table(&mut p, "live_d4", "id INT8 PRIMARY KEY, v STRING");
+    p.query("INSERT INTO live_d4 VALUES (1, 'a')");
+    let reply = p.call("get_add_column_sql", json!({"table": "live_d4", "column": {"name": "tenant", "data_type": "INT8", "is_nullable": false, "is_pk": true, "default_value": "0"}}));
+    assert_eq!(
+        reply["result"].as_array().unwrap().len(),
+        2,
+        "add the column, then alter the key: {reply}"
+    );
+    run_statements(&mut p, &reply);
+    assert_eq!(pk_columns(&mut p, "live_d4"), ["id", "tenant"]);
+    assert_eq!(
+        count(&mut p, "live_d4"),
+        1,
+        "existing data survives the key change"
+    );
+
+    // A table keyed by the hidden rowid: the new column becomes the whole key.
+    fresh_table(&mut p, "live_d4b", "name STRING");
+    p.query("INSERT INTO live_d4b VALUES ('x')");
+    let reply = p.call("get_add_column_sql", json!({"table": "live_d4b", "column": {"name": "id", "data_type": "INT8", "is_nullable": false, "is_pk": true, "default_value": "1"}}));
+    run_statements(&mut p, &reply);
+    assert_eq!(pk_columns(&mut p, "live_d4b"), ["id"]);
+    drop_tables(&mut p, &["live_d4", "live_d4b"]);
+}
+
+#[test]
+fn altering_a_column_renames_retypes_and_changes_constraints() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_d5",
+        "id INT8 PRIMARY KEY, name VARCHAR(50) NOT NULL DEFAULT 'x', note STRING",
+    );
+    p.query("INSERT INTO live_d5 (id, name) VALUES (1, 'a')");
+    let old = json!({"name": "name", "data_type": "VARCHAR(50)", "is_nullable": false, "is_pk": false, "default_value": "'x'"});
+    let new = json!({"name": "title", "data_type": "VARCHAR(100)", "is_nullable": true, "is_pk": false, "default_value": null, "comment": "display name"});
+    let reply = p.call(
+        "get_alter_column_sql",
+        json!({"table": "live_d5", "old_column": old, "new_column": new}),
+    );
+    assert_eq!(reply["result"].as_array().unwrap().len(), 5, "{reply}");
+    run_statements(&mut p, &reply);
+    let c = column_of(&mut p, "live_d5", "title");
+    assert_eq!(c["character_maximum_length"], 100);
+    assert_eq!(
+        (
+            c["is_nullable"].as_bool(),
+            c["default_value"].is_null(),
+            c["comment"].as_str()
+        ),
+        (Some(true), true, Some("display name"))
+    );
+    assert_eq!(
+        rows_of(&mut p, "SELECT title FROM live_d5")[0][0],
+        "a",
+        "the data is kept"
+    );
+
+    // Setting and clearing the other attributes, and clearing a comment.
+    let back = json!({"name": "title", "data_type": "VARCHAR(100)", "is_nullable": false, "is_pk": false, "default_value": "'y'"});
+    let reply = p.call(
+        "get_alter_column_sql",
+        json!({"table": "live_d5", "old_column": new, "new_column": back}),
+    );
+    run_statements(&mut p, &reply);
+    let c = column_of(&mut p, "live_d5", "title");
+    assert_eq!(
+        (
+            c["is_nullable"].as_bool(),
+            c["default_value"].as_str(),
+            c["comment"].is_null()
+        ),
+        (Some(false), Some("'y'"), true)
+    );
+
+    // Nothing to do is reported, not turned into an empty statement.
+    let same = p.call(
+        "get_alter_column_sql",
+        json!({"table": "live_d5", "old_column": back, "new_column": back}),
+    );
+    assert!(error_text(&same).contains("No changes detected"), "{same}");
+    p.query("DROP TABLE live_d5");
+}
+
+#[test]
+fn type_changes_that_keep_the_data_shape_run_in_place_on_every_release() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(
+        &mut p,
+        "live_d6",
+        "id INT8 PRIMARY KEY, ts TIMESTAMP, j JSON, d DECIMAL(10,2), s VARCHAR(10)",
+    );
+    p.query("INSERT INTO live_d6 VALUES (1, '2024-01-01 10:00:00', '{\"a\":1}', 1.50, 'abc')");
+    for (name, from, to) in [
+        ("ts", "TIMESTAMP", "TIMESTAMPTZ"),
+        ("j", "JSON", "JSONB"),
+        ("d", "DECIMAL(10,2)", "DECIMAL(12,2)"),
+        ("s", "VARCHAR(10)", "VARCHAR(40)"),
+    ] {
+        let reply = p.call(
+            "get_alter_column_sql",
+            json!({"table": "live_d6",
+            "old_column": {"name": name, "data_type": from, "is_nullable": true, "is_pk": false},
+            "new_column": {"name": name, "data_type": to, "is_nullable": true, "is_pk": false}}),
+        );
+        assert_eq!(
+            reply["result"].as_array().unwrap().len(),
+            1,
+            "{name}: {reply}"
+        );
+        assert!(
+            !reply["result"][0].as_str().unwrap().contains("USING"),
+            "{name}: no conversion needed"
+        );
+        run_statements(&mut p, &reply);
+    }
+    assert_eq!(
+        column_of(&mut p, "live_d6", "s")["character_maximum_length"],
+        40
+    );
+    assert_eq!(rows_of(&mut p, "SELECT s FROM live_d6")[0][0], "abc");
+    p.query("DROP TABLE live_d6");
+}
+
+#[test]
+fn converting_a_column_needs_using_and_on_v24_3_the_experimental_setting() {
+    let Some(mut p) = Plugin::start() else { return };
+    let major = major_version(&mut p);
+    fresh_table(&mut p, "live_d7", "id INT8 PRIMARY KEY, n INT8, s STRING");
+    p.query("INSERT INTO live_d7 VALUES (1, 42, '7')");
+    for (col, from, to, expected) in [
+        ("n", "INT8", "STRING", json!("42")),
+        ("s", "STRING", "INT8", json!(7)),
+    ] {
+        let reply = p.call(
+            "get_alter_column_sql",
+            json!({"table": "live_d7",
+            "old_column": {"name": col, "data_type": from, "is_nullable": true, "is_pk": false},
+            "new_column": {"name": col, "data_type": to, "is_nullable": true, "is_pk": false}}),
+        );
+        let sql = reply["result"][0].as_str().unwrap();
+        assert!(
+            sql.contains(&format!("USING \"{col}\"::{to}")) && sql.starts_with("--"),
+            "{sql}"
+        );
+        let r = p.query(sql);
+        if r.get("error").is_none() {
+            assert_eq!(
+                rows_of(&mut p, &format!("SELECT {col} FROM live_d7"))[0][0],
+                expected,
+                "converted data"
+            );
+        } else {
+            // v24.3 refuses without the setting, and the server's own error names it.
+            assert!(major < 25, "a release this new needs no setting: {r}");
+            assert!(
+                error_text(&r).contains("enable_experimental_alter_column_type_general"),
+                "{r}"
+            );
+        }
+    }
+    p.query("DROP TABLE live_d7");
+}
+
+#[test]
+fn an_index_name_used_by_two_tables_drops_only_the_named_one() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_d8a", "id INT8 PRIMARY KEY, c STRING");
+    fresh_table(&mut p, "live_d8b", "id INT8 PRIMARY KEY, c STRING");
+    for t in ["live_d8a", "live_d8b"] {
+        let reply = p.call("get_create_index_sql", json!({"table": t, "index_name": "idx_c", "columns": ["c"], "is_unique": t == "live_d8a"}));
+        assert_eq!(reply["result"].as_array().unwrap().len(), 1);
+        run_statements(&mut p, &reply);
+    }
+    let a = p.call("get_indexes", json!({"table": "live_d8a"}));
+    assert_eq!(
+        a["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "idx_c")
+            .unwrap()["is_unique"],
+        true
+    );
+
+    let r = p.call(
+        "drop_index",
+        json!({"table": "live_d8a", "index_name": "idx_c"}),
+    );
+    assert!(r.get("error").is_none() && r["result"].is_null(), "{r}");
+    assert!(!index_names(&mut p, "live_d8a").contains(&"idx_c".to_string()));
+    assert!(
+        index_names(&mut p, "live_d8b").contains(&"idx_c".to_string()),
+        "the other table's index of the same name must survive"
+    );
+    drop_tables(&mut p, &["live_d8a", "live_d8b"]);
+}
+
+#[test]
+fn an_index_behind_a_referenced_unique_constraint_is_not_dropped_silently() {
+    let Some(mut p) = Plugin::start() else { return };
+    drop_tables(&mut p, &["live_d9b", "live_d9a"]);
+    p.query("CREATE TABLE live_d9a (id INT8 PRIMARY KEY, email STRING UNIQUE)");
+    p.query("CREATE TABLE live_d9b (id INT8 PRIMARY KEY, e STRING REFERENCES live_d9a (email))");
+    let r = p.call(
+        "drop_index",
+        json!({"table": "live_d9a", "index_name": "live_d9a_email_key"}),
+    );
+    let msg = error_text(&r);
+    assert!(
+        msg.contains("2BP01") && msg.contains("Nothing was dropped") && msg.contains("CASCADE"),
+        "{r}"
+    );
+    assert!(index_names(&mut p, "live_d9a").contains(&"live_d9a_email_key".to_string()));
+    let fk = p.call("get_foreign_keys", json!({"table": "live_d9b"}));
+    assert_eq!(
+        fk["result"].as_array().unwrap().len(),
+        1,
+        "the foreign key is untouched"
+    );
+    drop_tables(&mut p, &["live_d9b", "live_d9a"]);
+}
+
+#[test]
+fn foreign_keys_are_created_with_their_actions_and_dropped_by_name() {
+    let Some(mut p) = Plugin::start() else { return };
+    drop_tables(&mut p, &["live_d10b", "live_d10a"]);
+    p.query("CREATE TABLE live_d10a (id INT8 PRIMARY KEY)");
+    p.query("CREATE TABLE live_d10b (id INT8 PRIMARY KEY, a_id INT8)");
+    let reply = p.call("get_create_foreign_key_sql", json!({"table": "live_d10b", "fk_name": "fk_a", "column": "a_id", "ref_table": "live_d10a", "ref_column": "id", "on_delete": "cascade", "on_update": "NO ACTION"}));
+    run_statements(&mut p, &reply);
+    let fk = &p.call("get_foreign_keys", json!({"table": "live_d10b"}))["result"][0];
+    assert_eq!(
+        (
+            fk["name"].as_str(),
+            fk["ref_table"].as_str(),
+            fk["on_delete"].as_str(),
+            fk["on_update"].as_str()
+        ),
+        (
+            Some("fk_a"),
+            Some("live_d10a"),
+            Some("CASCADE"),
+            Some("NO ACTION")
+        )
+    );
+
+    // An action that is not one of the five is refused before any SQL is built.
+    let bad = p.call("get_create_foreign_key_sql", json!({"table": "live_d10b", "fk_name": "x", "column": "a_id", "ref_table": "live_d10a", "ref_column": "id", "on_delete": "CASCADE; DROP TABLE live_d10a"}));
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+
+    let r = p.call(
+        "drop_foreign_key",
+        json!({"table": "live_d10b", "fk_name": "fk_a"}),
+    );
+    assert!(r.get("error").is_none() && r["result"].is_null(), "{r}");
+    assert_eq!(
+        p.call("get_foreign_keys", json!({"table": "live_d10b"}))["result"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    drop_tables(&mut p, &["live_d10b", "live_d10a"]);
+}
+
+#[test]
+fn views_can_be_created_replaced_and_dropped() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP VIEW IF EXISTS live_v1");
+    fresh_table(&mut p, "live_v0", "id INT8 PRIMARY KEY, name STRING");
+    p.query("INSERT INTO live_v0 VALUES (1, 'a')");
+
+    let r = p.call(
+        "create_view",
+        json!({"view_name": "live_v1", "definition": "SELECT id, name FROM live_v0;"}),
+    );
+    assert!(r.get("error").is_none() && r["result"].is_null(), "{r}");
+    assert!(p.call("get_views", json!({}))["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["name"] == "live_v1"));
+    let dup = p.call(
+        "create_view",
+        json!({"view_name": "live_v1", "definition": "SELECT 1"}),
+    );
+    assert!(error_text(&dup).contains("already exists"), "{dup}");
+
+    // Appending a column replaces the view in place.
+    let r = p.call("alter_view", json!({"view_name": "live_v1", "definition": "SELECT id, name, id + 1 AS next FROM live_v0"}));
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT * FROM live_v1")[0],
+        json!([1, "a", 2])
+    );
+
+    // Dropping a column cannot be done in place: the view is dropped and created again.
+    let r = p.call(
+        "alter_view",
+        json!({"view_name": "live_v1", "definition": "SELECT name FROM live_v0"}),
+    );
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(rows_of(&mut p, "SELECT * FROM live_v1")[0], json!(["a"]));
+
+    let r = p.call("drop_view", json!({"view_name": "live_v1"}));
+    assert!(r.get("error").is_none() && r["result"].is_null(), "{r}");
+    assert!(!p.call("get_views", json!({}))["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["name"] == "live_v1"));
+    // Dropping a view that is already gone is not an error.
+    assert!(p
+        .call("drop_view", json!({"view_name": "live_v1"}))
+        .get("error")
+        .is_none());
+    p.query("DROP TABLE live_v0");
+}
+
+#[test]
+fn a_view_that_fails_to_replace_keeps_its_old_definition() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    p.query("DROP VIEW IF EXISTS live_v2");
+    fresh_table(&mut p, "live_v2t", "id INT8 PRIMARY KEY, name STRING");
+    p.query("INSERT INTO live_v2t VALUES (1, 'a')");
+    p.call(
+        "create_view",
+        json!({"view_name": "live_v2", "definition": "SELECT id, name FROM live_v2t"}),
+    );
+
+    // A syntax error, once for the in-place path...
+    let bad = p.call(
+        "alter_view",
+        json!({"view_name": "live_v2", "definition": "SELEKT 1"}),
+    );
+    assert!(error_text(&bad).contains("syntax error"), "{bad}");
+    // ...and once where the drop-and-create path is taken (a dropped column), where the
+    // transaction must roll the DROP back.
+    let bad = p.call(
+        "alter_view",
+        json!({"view_name": "live_v2", "definition": "SELECT name FROM live_v2t WHERE nope = 1"}),
+    );
+    assert!(bad.get("error").is_some(), "{bad}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT * FROM live_v2")[0],
+        json!([1, "a"]),
+        "the old view survives both failures"
+    );
+    // With one connection in the pool, a failure must not have left a transaction behind.
+    assert_eq!(count(&mut p, "live_v2t"), 1);
+
+    // A view another view depends on cannot be dropped and recreated; nothing changes.
+    p.call(
+        "create_view",
+        json!({"view_name": "live_v2d", "definition": "SELECT id FROM live_v2"}),
+    );
+    let blocked = p.call(
+        "alter_view",
+        json!({"view_name": "live_v2", "definition": "SELECT name FROM live_v2t"}),
+    );
+    assert!(blocked.get("error").is_some(), "{blocked}");
+    assert_eq!(rows_of(&mut p, "SELECT * FROM live_v2")[0], json!([1, "a"]));
+    p.call("drop_view", json!({"view_name": "live_v2d"}));
+    p.call("drop_view", json!({"view_name": "live_v2"}));
+    p.query("DROP TABLE live_v2t");
+}
+
+#[test]
+fn text_that_could_carry_sql_is_refused_before_any_statement_exists() {
+    let Some(mut p) = Plugin::start() else { return };
+    fresh_table(&mut p, "live_d11", "id INT8 PRIMARY KEY");
+    let attempts = [
+        p.call("get_add_column_sql", json!({"table": "live_d11", "column": {"name": "x", "data_type": "INT8); DROP TABLE live_d11; --", "is_nullable": true}})),
+        p.call("get_add_column_sql", json!({"table": "live_d11", "column": {"name": "x", "data_type": "INT8", "is_nullable": true, "default_value": "1; DROP TABLE live_d11"}})),
+        p.call("get_create_table_sql", json!({"table_name": "live_d11x", "columns": [{"name": "a", "data_type": "STRING", "default_value": "'x' -- c"}]})),
+        p.call("create_view", json!({"view_name": "live_v3", "definition": "SELECT 1; DROP TABLE live_d11"})),
+        p.call("alter_view", json!({"view_name": "live_v3", "definition": "SELECT 1 /* open"})),
+    ];
+    for r in &attempts {
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    assert_eq!(count(&mut p, "live_d11"), 0, "the table is still there");
+    // Hostile names are quoted, not interpreted.
+    let r = p.call("get_create_index_sql", json!({"table": "live_d11", "index_name": "i\"; DROP TABLE live_d11; --", "columns": ["id"]}));
+    assert!(
+        r["result"][0]
+            .as_str()
+            .unwrap()
+            .contains("\"i\"\"; DROP TABLE live_d11; --\""),
+        "{r}"
+    );
+    p.query("DROP TABLE live_d11");
+}
+
+#[test]
+fn a_failed_ddl_call_leaves_the_connection_clean_for_the_next() {
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    fresh_table(&mut p, "live_d12", "id INT8 PRIMARY KEY");
+    let missing = p.call(
+        "drop_index",
+        json!({"table": "live_d12", "index_name": "no_such_index"}),
+    );
+    assert!(missing.get("error").is_some(), "{missing}");
+    let missing_fk = p.call(
+        "drop_foreign_key",
+        json!({"table": "live_d12", "fk_name": "no_such_fk"}),
+    );
+    assert!(missing_fk.get("error").is_some(), "{missing_fk}");
+    let ok = p.call(
+        "create_view",
+        json!({"view_name": "live_v4", "definition": "SELECT id FROM live_d12"}),
+    );
+    assert!(ok.get("error").is_none(), "{ok}");
+    p.call("drop_view", json!({"view_name": "live_v4"}));
+    p.query("DROP TABLE live_d12");
+}
+
+#[test]
+fn the_schema_defaults_to_the_current_one_and_can_be_named_for_ddl() {
+    let Some(mut p) = Plugin::start() else { return };
+    p.query("DROP SCHEMA IF EXISTS live_d13s CASCADE");
+    p.query("CREATE SCHEMA live_d13s");
+    let reply = p.call("get_create_table_sql", json!({"table_name": "t", "schema": "live_d13s", "columns": [{"name": "id", "data_type": "INT8", "is_nullable": false, "is_pk": true}]}));
+    assert!(
+        reply["result"][0]
+            .as_str()
+            .unwrap()
+            .contains("\"live_d13s\".\"t\""),
+        "{reply}"
+    );
+    run_statements(&mut p, &reply);
+    assert_eq!(rows_of(&mut p, "SELECT count(*) FROM live_d13s.t")[0][0], 0);
+    // No schema named: the session's current schema, `public`.
+    let reply = p.call(
+        "get_create_table_sql",
+        json!({"table_name": "t", "columns": [{"name": "id", "data_type": "INT8", "is_pk": true}]}),
+    );
+    assert!(
+        reply["result"][0]
+            .as_str()
+            .unwrap()
+            .contains("\"public\".\"t\""),
+        "{reply}"
+    );
+    p.query("DROP SCHEMA live_d13s CASCADE");
+}
