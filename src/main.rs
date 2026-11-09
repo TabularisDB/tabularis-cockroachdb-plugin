@@ -17,6 +17,7 @@ mod binding;
 mod cancel;
 mod client;
 mod crud;
+mod ddl;
 mod error;
 mod extract;
 mod handlers;
