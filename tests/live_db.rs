@@ -2413,3 +2413,48 @@ fn the_schema_defaults_to_the_current_one_and_can_be_named_for_ddl() {
     );
     p.query("DROP SCHEMA live_d13s CASCADE");
 }
+
+#[test]
+fn a_view_query_resolves_unqualified_names_in_the_schema_it_is_created_in() {
+    // A user working in a schema writes `FROM customers`, not `FROM schema.customers`.
+    let Some(mut p) = Plugin::start_with(json!({"poolMaxSize": 1})) else {
+        return;
+    };
+    p.query("DROP SCHEMA IF EXISTS live_vs CASCADE");
+    p.query("CREATE SCHEMA live_vs");
+    p.query("CREATE TABLE live_vs.customers (id INT8 PRIMARY KEY, name STRING)");
+    p.query("INSERT INTO live_vs.customers VALUES (1, 'a')");
+
+    let r = p.call("create_view", json!({"schema": "live_vs", "view_name": "names", "definition": "SELECT id, name FROM customers"}));
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT * FROM live_vs.names")[0],
+        json!([1, "a"])
+    );
+
+    // In place (a column appended) and by drop-and-create (a column dropped).
+    let r = p.call("alter_view", json!({"schema": "live_vs", "view_name": "names", "definition": "SELECT id, name, id + 1 AS next FROM customers"}));
+    assert!(r.get("error").is_none(), "{r}");
+    let r = p.call("alter_view", json!({"schema": "live_vs", "view_name": "names", "definition": "SELECT name FROM customers"}));
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(
+        rows_of(&mut p, "SELECT * FROM live_vs.names")[0],
+        json!(["a"])
+    );
+
+    // The search path was only for those calls: the single pooled connection is back to its default.
+    let path = rows_of(&mut p, "SHOW search_path");
+    assert!(
+        !path[0][0].as_str().unwrap().contains("live_vs"),
+        "the search path leaked: {path:?}"
+    );
+    // And a failing call does not leave it set either.
+    let bad = p.call("create_view", json!({"schema": "live_vs", "view_name": "broken", "definition": "SELECT x FROM no_such_table"}));
+    assert!(bad.get("error").is_some(), "{bad}");
+    let path = rows_of(&mut p, "SHOW search_path");
+    assert!(
+        !path[0][0].as_str().unwrap().contains("live_vs"),
+        "the search path leaked after a failure: {path:?}"
+    );
+    p.query("DROP SCHEMA live_vs CASCADE");
+}

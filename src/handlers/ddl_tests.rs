@@ -35,7 +35,7 @@ fn a_failure_after_the_drop_brings_the_old_view_back() {
         // The DROP succeeds, the second statement fails: the view must survive.
         let client = entry.pool.get().await.unwrap();
         let failed = run_in_transaction(
-            client,
+            &client,
             &[
                 "DROP VIEW live_tx_v".to_string(),
                 "SELECT * FROM live_tx_no_such_table".to_string(),
@@ -43,6 +43,7 @@ fn a_failure_after_the_drop_brings_the_old_view_back() {
         )
         .await;
         assert!(failed.is_err());
+        finish(client).await;
 
         let check = entry.pool.get().await.unwrap();
         let rows = check
@@ -57,7 +58,7 @@ fn a_failure_after_the_drop_brings_the_old_view_back() {
         // The same statements that succeed are applied together.
         let client = entry.pool.get().await.unwrap();
         run_in_transaction(
-            client,
+            &client,
             &[
                 "DROP VIEW live_tx_v".to_string(),
                 "CREATE VIEW live_tx_v AS SELECT name FROM live_tx_t".to_string(),
@@ -65,6 +66,7 @@ fn a_failure_after_the_drop_brings_the_old_view_back() {
         )
         .await
         .unwrap();
+        finish(client).await;
         let rows = check.query("SELECT * FROM live_tx_v", &[]).await.unwrap();
         assert_eq!(rows[0].len(), 1, "the view now has one column");
         check

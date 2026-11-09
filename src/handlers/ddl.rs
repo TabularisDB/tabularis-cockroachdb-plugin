@@ -232,17 +232,35 @@ async fn run_statement(client: &Object, sql: &str) -> Result<(), QueryError> {
 }
 
 /// Run `statements` in one explicit transaction. On failure the transaction is
-/// rolled back, and the connection is closed if even that fails.
-async fn run_in_transaction(client: Object, statements: &[String]) -> Result<(), QueryError> {
+/// rolled back (best effort; [`finish`] makes sure the connection is clean).
+async fn run_in_transaction(client: &Object, statements: &[String]) -> Result<(), QueryError> {
     let script = format!("BEGIN; {}; COMMIT", statements.join("; "));
     match client.batch_execute(&script).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            if client.batch_execute("ROLLBACK").await.is_err() {
-                drop(Object::take(client));
-            }
+            let _ = client.batch_execute("ROLLBACK").await;
             Err(e.into())
         }
+    }
+}
+
+/// Point the connection at `schema` for statements that contain user SQL: a
+/// view's query names its tables, and a user working in a schema writes them
+/// unqualified. Must be paired with [`finish`].
+async fn use_schema(client: &Object, schema: &str) -> Result<(), QueryError> {
+    let sql = format!(
+        "SET search_path TO {}",
+        crate::introspection::quote_ident(schema)
+    );
+    Ok(client.batch_execute(&sql).await?)
+}
+
+/// Undo [`use_schema`] and any transaction left open before the connection goes
+/// back to the pool, which does not reset connections. If that fails the
+/// connection cannot be trusted, so it is closed.
+async fn finish(client: Object) {
+    if client.batch_execute("ROLLBACK; RESET ALL").await.is_err() {
+        drop(Object::take(client));
     }
 }
 
@@ -306,11 +324,17 @@ async fn create_view_inner(params: &Value) -> Result<Value, PluginError> {
     let definition = text(params, &["definition"])?;
     let (client, schema) = checkout(&connection(params), params).await?;
     let sql = ddl::build_create_view(&schema, view, definition)?;
-    run_statement(&client, &sql).await.map_err(query_error)?;
+    let outcome = match use_schema(&client, &schema).await {
+        Ok(()) => run_statement(&client, &sql).await,
+        Err(e) => Err(e),
+    };
+    finish(client).await;
+    outcome.map_err(query_error)?;
     Ok(Value::Null)
 }
 
-/// Replace a view's query. `CREATE OR REPLACE VIEW` can append columns but not
+/// Replace a view's query, resolving unqualified table names in the schema it
+/// lives in. `CREATE OR REPLACE VIEW` can append columns but not
 /// change or drop one (SQLSTATE `42P16`). In that case the view is dropped and
 /// created again in one transaction: if anything fails between the two, the old
 /// view comes back. The view is still not visible for a short moment (about
@@ -326,18 +350,21 @@ async fn alter_view_inner(params: &Value) -> Result<Value, PluginError> {
     let definition = text(params, &["definition"])?;
     let (client, schema) = checkout(&connection(params), params).await?;
     let replace = ddl::build_replace_view(&schema, view, definition)?;
-    match run_statement(&client, &replace).await {
-        Ok(()) => Ok(Value::Null),
-        Err(e) if e.sqlstate.as_deref() == Some(ddl::VIEW_REPLACE_INCOMPATIBLE) => {
-            let drop = ddl::build_drop_view(&schema, view)?;
-            let create = ddl::build_create_view(&schema, view, definition)?;
-            run_in_transaction(client, &[drop, create])
-                .await
-                .map_err(query_error)?;
-            Ok(Value::Null)
-        }
-        Err(e) => Err(query_error(e)),
-    }
+    let drop = ddl::build_drop_view(&schema, view)?;
+    let create = ddl::build_create_view(&schema, view, definition)?;
+
+    let outcome = match use_schema(&client, &schema).await {
+        Err(e) => Err(e),
+        Ok(()) => match run_statement(&client, &replace).await {
+            Err(e) if e.sqlstate.as_deref() == Some(ddl::VIEW_REPLACE_INCOMPATIBLE) => {
+                run_in_transaction(&client, &[drop, create]).await
+            }
+            other => other,
+        },
+    };
+    finish(client).await;
+    outcome.map_err(query_error)?;
+    Ok(Value::Null)
 }
 
 pub async fn drop_view(id: Value, params: &Value) -> Value {
