@@ -9,23 +9,61 @@ release workflow publishes that section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-11-09
+
+Adds schema management: creating and altering tables, columns, indexes, foreign
+keys and views from Tabularis's dialogs. Tested against CockroachDB v24.3 and
+the latest release.
+
 ### Added
 
-- **Schema management** (phase 5): `get_create_table_sql`, `get_add_column_sql`,
+- **Schema management**: `get_create_table_sql`, `get_add_column_sql`,
   `get_alter_column_sql`, `get_create_index_sql`, `get_create_foreign_key_sql`,
   `drop_index`, `drop_foreign_key`, `create_view`, `alter_view` and `drop_view`.
-  Primary keys are named `<table>_pkey`; `SERIAL` keeps its width; a new primary
-  key column extends the table's key through `ALTER PRIMARY KEY`; converting a
-  column's type adds `USING` and a note about the v24.3 session setting; indexes
-  are dropped as `schema.table@index`; a view whose columns change is replaced by
-  dropping and creating it in one transaction. Types, defaults and view queries
-  are validated before they are used in SQL, foreign key actions are limited to
-  the five SQL actions, and drops never cascade.
+  - Primary keys are named `<table>_pkey`, composite keys work, and `SERIAL`
+    columns keep their width (`SMALLSERIAL`, `SERIAL4`, `SERIAL`).
+  - A new primary key column is added and then extends the table's key through
+    `ALTER PRIMARY KEY` (CockroachDB rejects `ADD COLUMN .. PRIMARY KEY` on a
+    table that already has a key). A table with no key still generates, with a
+    warning comment.
+  - Altering a column emits one statement per change (rename, type, nullability,
+    default, description). A change that converts data gets `USING` and a note
+    about the session setting CockroachDB v24.3 needs.
+  - Indexes are dropped as `schema.table@index`, so an index name shared by two
+    tables is never ambiguous.
+  - A view whose columns change is replaced by dropping and creating it in one
+    transaction, so a failure in between restores the old view. A view's query
+    resolves unqualified table names in the view's own schema.
+  - Types, default expressions and view queries are validated before they are
+    used in SQL (no `;`, no comment, nothing left open), names are always quoted,
+    foreign key actions are limited to the five SQL actions, and drops never
+    cascade.
 
 ### Changed
 
-- `docs/architecture/04-ddl.md` now records the host's real request and reply
-  shapes and what was verified on v24.3 and v26.3.
+- `docs/architecture/04-ddl.md` records the host's real request and reply shapes
+  and what was verified on v24.3 and v26.3.
+
+### Known limitations
+
+Tracked in [#16](https://github.com/TabularisDB/tabularis-cockroachdb-plugin/issues/16):
+
+- `EXPLAIN` is not implemented; the explain button returns "Method not found".
+- Materialized views, sequences, routines, triggers, multi-region metadata and
+  the schema snapshot (ER diagram) are not provided yet.
+- Schema management follows what the host's dialogs send. Options they do not
+  offer are not generated: `STORING`, hash-sharded, inverted and partial indexes,
+  `NOT VALID` foreign keys, comments on tables and schemas, and `LOCALITY`.
+- On v24.3, a type change that converts data needs
+  `SET enable_experimental_alter_column_type_general = true` in the same session.
+  The host runs each generated statement separately, so the setting is explained
+  in a comment and not emitted; v26.3 needs nothing.
+- Replacing a view whose columns change makes it invisible for about 70 ms. A
+  view other views depend on cannot be replaced, and an index behind a referenced
+  `UNIQUE` constraint is not dropped (the error gives the `CASCADE` statement).
+- Not exercised against a real CockroachDB Cloud cluster, nor query cancellation
+  behind a load balancer; a real `40001` retry of an implicit statement could not
+  be provoked on the tested releases.
 
 ## [0.1.0-alpha.1] - 2026-10-27
 
