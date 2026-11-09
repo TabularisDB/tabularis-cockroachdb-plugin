@@ -2,7 +2,7 @@
 
 ## Status
 
-Alpha (`0.1.0-alpha.1`). Connection and TLS, schema browsing, result decoding,
+Alpha (`0.1.0-alpha.2`). Connection and TLS, schema browsing, result decoding,
 query execution (batches, sessions, cancellation, retries), row editing with
 BLOBs, and schema management (create/alter table and column, indexes, foreign
 keys, views) are implemented and tested. Still stubs that return `-32601`:
