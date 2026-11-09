@@ -47,7 +47,11 @@ jobs:
             archive: zip
             binary-suffix: ""
           - platform-label: darwin-arm64
-            runner: macos-14
+            # `macos-14` is no longer offered ("The configuration
+            # 'macos-14-arm64-us-default' is not supported"), which cancels this
+            # leg and with it the whole release. `macos-latest` is an arm64
+            # machine, so this builds natively.
+            runner: macos-latest
             target: aarch64-apple-darwin
             archive: zip
             binary-suffix: ""
