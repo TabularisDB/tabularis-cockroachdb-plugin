@@ -9,6 +9,32 @@ release workflow publishes that section as the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-11-10
+
+Adds materialized views: the explorer section the manifest has always
+advertised now works. Tested against CockroachDB v24.3 and the latest release.
+
+### Added
+
+- **Materialized views** (#23): `get_materialized_views`,
+  `get_materialized_view_columns`, `get_materialized_view_definition` and
+  `refresh_materialized_view`.
+  - Listing comes from `SHOW TABLES` filtered on `type = 'materialized view'`,
+    with the `information_schema.tables` fallback when the role cannot run
+    `SHOW TABLES`. Only the requested schema's views are returned.
+  - Columns reuse the `get_columns` query, so canonical types, comments and
+    hidden-column filtering (`rowid`) behave exactly as for tables.
+  - The definition comes from `SHOW CREATE VIEW` (materialized views are
+    absent from `information_schema.views`).
+  - `REFRESH MATERIALIZED VIEW` quotes identifiers, and server errors
+    (missing view, permissions) surface with their SQLSTATE.
+
+### Fixed
+
+- The `materialized_views: true` capability no longer points at `-32601`
+  stubs: discovery previously degraded to a silently empty list and refresh
+  to an unsupported-driver error.
+
 ## [0.1.0-alpha.2] - 2026-11-09
 
 Adds schema management: creating and altering tables, columns, indexes, foreign
