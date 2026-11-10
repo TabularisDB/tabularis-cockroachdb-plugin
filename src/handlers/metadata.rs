@@ -1,7 +1,8 @@
 //! Schema metadata: databases, schemas, tables, columns, indexes, FKs,
 //! views, DDL. SQL and row shaping live in `crate::introspection`.
 //!
-//! Routines, schema snapshot and the other phase-7 methods are still stubs.
+//! Materialized views are implemented; routines, schema snapshot and the
+//! other phase-7 methods are still stubs.
 //!
 //! Full reference: https://github.com/TabularisDB/tabularis/blob/main/plugins/PLUGIN_GUIDE.md#5-required-methods
 
@@ -349,6 +350,62 @@ pub async fn get_views(id: Value, params: &Value) -> Value {
                     .map(|(name, _, _)| json!({ "name": name, "schema": c.schema }))
                     .collect(),
             ))
+        }
+        .await,
+    )
+}
+
+pub async fn get_materialized_views(id: Value, params: &Value) -> Value {
+    result_response(
+        id,
+        async {
+            let c = ctx(params).await?;
+            let views = list_relations(&c, RelKind::MaterializedView).await?;
+            Ok(Value::Array(
+                views
+                    .into_iter()
+                    .map(|(name, _, _)| json!({ "name": name, "schema": c.schema }))
+                    .collect(),
+            ))
+        }
+        .await,
+    )
+}
+
+pub async fn get_materialized_view_columns(id: Value, params: &Value) -> Value {
+    result_response(
+        id,
+        columns_of(params, &["view_name", "view", "table"]).await,
+    )
+}
+
+/// `SHOW CREATE VIEW` returns the definition of both plain and materialized
+/// views; materialized views are absent from `information_schema.views`, so
+/// there is no cheaper source.
+pub async fn get_materialized_view_definition(id: Value, params: &Value) -> Value {
+    result_response(
+        id,
+        async {
+            let view = str_param(params, &["view_name", "view", "table"])?;
+            let c = ctx(params).await?;
+            show_create(&c, "VIEW", view).await
+        }
+        .await,
+    )
+}
+
+pub async fn refresh_materialized_view(id: Value, params: &Value) -> Value {
+    result_response(
+        id,
+        async {
+            let view = str_param(params, &["view_name", "view", "table"])?;
+            let c = ctx(params).await?;
+            let sql = format!(
+                "REFRESH MATERIALIZED VIEW {}",
+                intro::qualified(&c.schema, view)
+            );
+            c.client.execute(&sql, &[]).await?;
+            Ok(Value::Null)
         }
         .await,
     )

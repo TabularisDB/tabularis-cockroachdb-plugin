@@ -232,6 +232,19 @@ fn show_tables_quotes_identifiers() {
 }
 
 #[test]
+fn rel_kind_maps_to_catalog_type_strings() {
+    assert_eq!(RelKind::Table.show_type(), "table");
+    assert_eq!(RelKind::View.show_type(), "view");
+    assert_eq!(RelKind::MaterializedView.show_type(), "materialized view");
+    assert_eq!(RelKind::Table.info_schema_type(), "BASE TABLE");
+    assert_eq!(RelKind::View.info_schema_type(), "VIEW");
+    assert_eq!(
+        RelKind::MaterializedView.info_schema_type(),
+        "MATERIALIZED VIEW"
+    );
+}
+
+#[test]
 fn comment_joins_pin_the_catalog() {
     assert!(TABLE_COMMENTS_SQL.contains("d.classoid = 'pg_catalog.pg_class'::REGCLASS"));
     assert!(columns_sql(TableFilter::One).contains("d.classoid = 'pg_catalog.pg_class'::REGCLASS"));

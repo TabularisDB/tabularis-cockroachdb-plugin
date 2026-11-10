@@ -47,6 +47,7 @@ pub const VIEW_DEFINITION_SQL: &str =
 pub enum RelKind {
     Table,
     View,
+    MaterializedView,
 }
 
 impl RelKind {
@@ -55,6 +56,7 @@ impl RelKind {
         match self {
             Self::Table => "table",
             Self::View => "view",
+            Self::MaterializedView => "materialized view",
         }
     }
 
@@ -63,6 +65,7 @@ impl RelKind {
         match self {
             Self::Table => "BASE TABLE",
             Self::View => "VIEW",
+            Self::MaterializedView => "MATERIALIZED VIEW",
         }
     }
 }
