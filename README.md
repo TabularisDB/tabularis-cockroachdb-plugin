@@ -32,7 +32,7 @@ wire protocol, but its catalog, type system, DDL, transaction model, and
 `EXPLAIN` output differ from PostgreSQL in ways that a plain PostgreSQL driver
 gets wrong. This plugin handles those differences natively.
 
-> **Status: alpha (`0.1.0-alpha.2`).** Connecting, browsing the schema, running
+> **Status: alpha (`0.1.0-alpha.3`).** Connecting, browsing the schema, running
 > queries, editing rows and managing tables, columns, indexes, foreign keys and
 > views work. `EXPLAIN` and a few metadata views are not implemented yet; see
 > [Known limitations](#known-limitations).

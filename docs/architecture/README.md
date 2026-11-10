@@ -55,7 +55,7 @@ are not done yet shows errors in the UI. That is expected during the alpha.
 | 5. DDL | Create/alter table, column, index, FK, comments, drops | 04 | Done |
 | 6. Plans | `explain_query` with the text-tree parser | 06 | To do |
 | 7. Extras | Materialized views (done), sequences, routines, multi-region metadata, schema snapshot | 02, 04 | In progress |
-| 8. Release | Live tests on the CI matrix, screenshots, `1.0.0` | 09 | In progress (`0.1.0-alpha.2`) |
+| 8. Release | Live tests on the CI matrix, screenshots, `1.0.0` | 09 | In progress (`0.1.0-alpha.3`) |
 
 Phase 5 covers the schema changes the host's dialogs request; `04-ddl.md` lists
 what is not generated. Phase 6 is tracked in issue #16.
