@@ -4,10 +4,10 @@
 
 Alpha (`0.1.0-alpha.2`). Connection and TLS, schema browsing, result decoding,
 query execution (batches, sessions, cancellation, retries), row editing with
-BLOBs, and schema management (create/alter table and column, indexes, foreign
-keys, views) are implemented and tested. Still stubs that return `-32601`:
-`explain_query` and the phase 7 metadata (materialized views, sequences,
-routines, schema snapshot). The `.tabularium` manifest declares the finished
+BLOBs, schema management (create/alter table and column, indexes, foreign
+keys, views), and materialized views (listing, columns, definition, refresh)
+are implemented and tested. Still stubs that return `-32601`: `explain_query`
+and the remaining phase 7 metadata (sequences, routines, schema snapshot). The `.tabularium` manifest declares the finished
 driver's capabilities, so those features show errors in the UI until they land.
 Tracked in issue #16. What to build, and in which order, is specified in
 `docs/architecture/` (start at `docs/architecture/README.md`).

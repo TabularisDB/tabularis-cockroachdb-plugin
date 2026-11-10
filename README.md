@@ -70,7 +70,8 @@ Available in this release:
   The plugin reads the real server version from `version()` and refuses to
   connect to a server that is not CockroachDB.
 - **Schema browsing**: databases, schemas, tables (with comments and row
-  estimates), views, columns (canonical types, comments, primary keys), indexes
+  estimates), views, materialized views (listing, columns, definition and
+  `REFRESH`), columns (canonical types, comments, primary keys), indexes
   (key, `STORING`, expression and hash-sharded columns), foreign keys including
   composite ones, and the `SHOW CREATE TABLE` DDL. Hidden columns such as
   `rowid` and `crdb_region` are excluded by default.
@@ -103,9 +104,9 @@ Planned (see [Known limitations](#known-limitations)):
 
 - **EXPLAIN**: `EXPLAIN` and `EXPLAIN ANALYZE` rendered as visual plans,
   including distributed execution details.
-- **More metadata**: materialized views, sequences, user-defined functions,
-  multi-region awareness (table localities, database regions, survival goals)
-  and the schema snapshot behind the ER diagram.
+- **More metadata**: sequences, user-defined functions, multi-region
+  awareness (table localities, database regions, survival goals) and the
+  schema snapshot behind the ER diagram.
 
 ## Known limitations
 
@@ -129,9 +130,8 @@ This is an alpha. These gaps are known and tracked in
   other views depend on cannot be replaced, and an index that backs a referenced
   `UNIQUE` constraint is not dropped: the error says so, and the exact
   `... CASCADE` statement is given for the SQL editor.
-- **Not yet listed in the sidebar or the ER diagram**: materialized views,
-  sequences, routines, triggers, multi-region metadata and the schema
-  snapshot.
+- **Not yet listed in the sidebar or the ER diagram**: sequences, routines,
+  triggers, multi-region metadata and the schema snapshot.
 - **Untested here**: `options=--cluster=...` against a real CockroachDB Cloud
   cluster, query cancellation behind a load balancer (the pgwire cancel
   request may reach another node), and a real `40001` retry of an implicit

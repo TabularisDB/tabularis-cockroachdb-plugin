@@ -74,6 +74,16 @@ async fn dispatch(method: &str, id: Value, params: Value) -> Value {
         "get_views" => handlers::metadata::get_views(id, &params).await,
         "get_view_definition" => handlers::metadata::get_view_definition(id, &params).await,
         "get_view_columns" => handlers::metadata::get_view_columns(id, &params).await,
+        "get_materialized_views" => handlers::metadata::get_materialized_views(id, &params).await,
+        "get_materialized_view_columns" => {
+            handlers::metadata::get_materialized_view_columns(id, &params).await
+        }
+        "get_materialized_view_definition" => {
+            handlers::metadata::get_materialized_view_definition(id, &params).await
+        }
+        "refresh_materialized_view" => {
+            handlers::metadata::refresh_materialized_view(id, &params).await
+        }
         "get_routines" => handlers::metadata::get_routines(id, &params).await,
         "get_routine_parameters" => handlers::metadata::get_routine_parameters(id, &params).await,
         "get_routine_definition" => handlers::metadata::get_routine_definition(id, &params).await,

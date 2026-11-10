@@ -7,6 +7,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -130,8 +131,36 @@ fn seed() {
                 ))
                 .await
                 .unwrap();
+            // Materialized views start an async backfill job per statement;
+            // bundling them into the batch above makes its implicit
+            // transaction flaky with `40001: descriptor is undergoing
+            // another schema change`. Run them one by one, with a retry.
+            for stmt in [
+                format!("CREATE MATERIALIZED VIEW {SCHEMA}.mv_users AS SELECT id, email FROM {SCHEMA}.users"),
+                format!("CREATE MATERIALIZED VIEW {SCHEMA}.\"Mv Quoted\" AS SELECT 1 AS one"),
+                format!("DROP SCHEMA IF EXISTS {SCHEMA}_mv2 CASCADE"),
+                format!("CREATE SCHEMA {SCHEMA}_mv2"),
+                format!("CREATE MATERIALIZED VIEW {SCHEMA}_mv2.mv_other AS SELECT 2 AS two"),
+            ] {
+                exec_retry(&client, &stmt).await;
+            }
         });
     });
+}
+
+/// Run one statement, retrying serialization failures (`40001`) that a
+/// still-running async schema-change job can cause right after `seed`'s DDL.
+async fn exec_retry(client: &tokio_postgres::Client, stmt: &str) {
+    for _ in 0..40 {
+        match client.batch_execute(stmt).await {
+            Ok(()) => return,
+            Err(e) if e.code().map(|c| c.code()) == Some("40001") => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("{stmt}: {e}"),
+        }
+    }
+    panic!("{stmt}: still failing with 40001 after 40 attempts");
 }
 
 fn call(method: &str, extra: Value) -> Option<Value> {
@@ -326,6 +355,139 @@ fn views_and_ddl() {
     assert!(ddl.as_str().unwrap().contains("CREATE TABLE"));
 }
 
+#[test]
+fn materialized_views_are_listed_with_columns_and_definition() {
+    let Some(v) = call("get_materialized_views", json!({})) else {
+        return;
+    };
+    let mut listed = names(&v, "name");
+    listed.sort();
+    // Only this schema's materialized views: not plain views, not tables,
+    // and not {SCHEMA}_mv2.mv_other.
+    assert_eq!(listed, ["Mv Quoted", "mv_users"]);
+    assert_eq!(v[0]["schema"], SCHEMA);
+
+    // Plain views do not leak into the materialized list or vice versa.
+    let plain = call("get_views", json!({})).unwrap();
+    assert_eq!(names(&plain, "name"), ["v_users"]);
+
+    // Schema isolation: the sibling schema sees only its own view.
+    let other = call(
+        "get_materialized_views",
+        json!({"schema": format!("{SCHEMA}_mv2")}),
+    )
+    .unwrap();
+    assert_eq!(names(&other, "name"), ["mv_other"]);
+
+    let cols = call(
+        "get_materialized_view_columns",
+        json!({"view_name": "mv_users"}),
+    )
+    .unwrap();
+    assert_eq!(names(&cols, "name"), ["id", "email"]);
+
+    let def = call(
+        "get_materialized_view_definition",
+        json!({"view_name": "mv_users"}),
+    )
+    .unwrap();
+    assert!(
+        def.as_str().unwrap().contains("CREATE MATERIALIZED VIEW"),
+        "{def}"
+    );
+
+    // Quoted identifiers work end to end.
+    let qcols = call(
+        "get_materialized_view_columns",
+        json!({"view_name": "Mv Quoted"}),
+    )
+    .unwrap();
+    assert_eq!(names(&qcols, "name"), ["one"]);
+    let qdef = call(
+        "get_materialized_view_definition",
+        json!({"view_name": "Mv Quoted"}),
+    )
+    .unwrap();
+    assert!(qdef.as_str().unwrap().contains("Mv Quoted"), "{qdef}");
+    let refreshed = call(
+        "refresh_materialized_view",
+        json!({"view_name": "Mv Quoted"}),
+    )
+    .unwrap();
+    assert!(refreshed.is_null());
+}
+
+#[test]
+fn refresh_materialized_view_shows_new_rows() {
+    if live_node().is_none() {
+        return;
+    }
+    seed();
+    // A private schema: adding tables to the shared fixture schema would
+    // race the other introspection tests.
+    const MVR: &str = "live_introspection_mvr";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (host, port) = live_node().unwrap();
+    let client = rt.block_on(async {
+        let (client, conn) = tokio_postgres::Config::new()
+            .host(&host)
+            .port(port)
+            .user("root")
+            .dbname("defaultdb")
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        // One statement at a time: in a single batch the materialized
+        // view's backfill would run after the whole implicit transaction,
+        // capturing the second row too.
+        for stmt in [
+            format!("DROP SCHEMA IF EXISTS {MVR} CASCADE"),
+            format!("CREATE SCHEMA {MVR}"),
+            format!("CREATE TABLE {MVR}.fresh_src (id INT PRIMARY KEY)"),
+            format!("INSERT INTO {MVR}.fresh_src VALUES (1)"),
+            format!("CREATE MATERIALIZED VIEW {MVR}.mv_fresh AS SELECT id FROM {MVR}.fresh_src"),
+            format!("INSERT INTO {MVR}.fresh_src VALUES (2)"),
+        ] {
+            exec_retry(&client, &stmt).await;
+        }
+        client
+    });
+    let count = |client: &tokio_postgres::Client| -> i64 {
+        rt.block_on(async {
+            client
+                .query_one(&format!("SELECT count(*) FROM {MVR}.mv_fresh"), &[])
+                .await
+                .unwrap()
+                .get(0)
+        })
+    };
+    assert_eq!(
+        count(&client),
+        1,
+        "materialized data is stale before refresh"
+    );
+    let r = call(
+        "refresh_materialized_view",
+        json!({"view_name": "mv_fresh", "schema": MVR}),
+    )
+    .unwrap();
+    assert!(r.is_null());
+    assert_eq!(count(&client), 2, "refresh picks up the new source row");
+}
+
+#[test]
+fn refresh_of_a_missing_materialized_view_surfaces_the_error() {
+    let Some(mut p) = conn("disable") else { return };
+    seed();
+    p["params"]["database"] = json!("defaultdb");
+    p["schema"] = json!(SCHEMA);
+    p["view_name"] = json!("mv_missing");
+    let r = rpc("refresh_materialized_view", p);
+    let msg = r["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("does not exist"), "{r}");
+}
+
 // ---- Phase 3: query execution ------------------------------------------
 //
 // These talk to ONE long-lived plugin process, because pinned sessions and
@@ -333,7 +495,6 @@ fn views_and_ddl() {
 
 use std::process::{Child, ChildStdin};
 use std::sync::mpsc;
-use std::time::Duration;
 
 struct Plugin {
     child: Child,
